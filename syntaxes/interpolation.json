@@ -1,0 +1,24 @@
+{
+  "scopeName": "nubond.interpolation",
+  "injectionSelector": "L:text.html -comment -string -meta.tag",
+  "patterns": [
+    { "include": "#interpolation" }
+  ],
+  "repository": {
+    "interpolation": {
+      "comment": "Parcel plugin {{expression}} interpolations in HTML text content",
+      "begin": "\\{\\{(?=[^<>]*\\}\\})",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.interpolation.begin.nubond" }
+      },
+      "end": "\\}\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.interpolation.end.nubond" }
+      },
+      "contentName": "meta.interpolation.nubond",
+      "patterns": [
+        { "include": "nubond.template#expression-content" }
+      ]
+    }
+  }
+}

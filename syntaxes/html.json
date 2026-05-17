@@ -1,0 +1,229 @@
+{
+  "scopeName": "nubond.template",
+  "injectionSelector": "L:meta.tag -comment -meta.attribute-value.nubond",
+  "patterns": [
+    { "include": "#nb-attribute-with-value" },
+    { "include": "#nb-attribute-no-value" }
+  ],
+  "repository": {
+    "nb-attribute-with-value": {
+      "comment": "Any nb-* attribute with =\"value\" — owns name through closing quote",
+      "begin": "(?:^|(?<=\\s))((?:data-)?nb-[\\w-]+(?::[\\w][\\w-]*(?::\\d+)?)?)\\s*(=)\\s*(\")",
+      "beginCaptures": {
+        "1": { "name": "support.class.nubond" },
+        "2": { "name": "punctuation.separator.key-value.html" },
+        "3": { "name": "punctuation.definition.string.begin.html" }
+      },
+      "end": "\"",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.string.end.html" }
+      },
+      "contentName": "meta.attribute-value.nubond",
+      "patterns": [
+        { "include": "#expression-content" }
+      ]
+    },
+    "nb-attribute-no-value": {
+      "comment": "nb-* attribute without a value (e.g. nb-default)",
+      "match": "(?:^|(?<=\\s))((?:data-)?nb-[\\w-]+(?::[\\w][\\w-]*)?)(?=\\s|>|/)",
+      "captures": {
+        "1": { "name": "support.class.nubond" }
+      }
+    },
+    "expression-content": {
+      "patterns": [
+        {
+          "comment": "Slot/route prefix: %name — highlight the whole value as a string",
+          "match": "(%)(\\w+)",
+          "captures": {
+            "1": { "name": "support.class.nubond" },
+            "2": { "name": "string.unquoted.nubond" }
+          }
+        },
+        {
+          "comment": "Single-bind prefix: #",
+          "match": "#",
+          "name": "support.class.nubond"
+        },
+        {
+          "comment": "@number literal: @123, @3.14",
+          "match": "@(\\d+(\\.\\d+)?)",
+          "captures": {
+            "0": { "name": "constant.numeric.decimal.ts" }
+          }
+        },
+        {
+          "comment": "@boolean literal: @true, @false",
+          "match": "@(true|false)\\b",
+          "captures": {
+            "0": { "name": "constant.language.boolean.ts" }
+          }
+        },
+        {
+          "comment": "@string literal: @anything_else",
+          "match": "@([^\"]+)",
+          "captures": {
+            "0": { "name": "string.unquoted.nubond" }
+          }
+        },
+        {
+          "comment": "Block comment /* ... */",
+          "begin": "/\\*",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.begin.ts" } },
+          "end": "\\*/",
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.end.ts" } },
+          "name": "comment.block.ts"
+        },
+        {
+          "comment": "Template literal with ${} interpolation — only after prefix, operator, or separator",
+          "begin": "(?<=[#@%=(,+:\"\\s\\[>?])`",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.template.begin.ts" } },
+          "end": "`",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.template.end.ts" } },
+          "name": "string.template.ts",
+          "patterns": [
+            {
+              "comment": "Template literal interpolation ${...}",
+              "begin": "\\$\\{",
+              "beginCaptures": { "0": { "name": "punctuation.definition.template-expression.begin.ts" } },
+              "end": "\\}",
+              "endCaptures": { "0": { "name": "punctuation.definition.template-expression.end.ts" } },
+              "contentName": "meta.template.expression.ts",
+              "patterns": [
+                { "include": "#expression-content" }
+              ]
+            },
+            {
+              "comment": "HTML tags inside template literal strings",
+              "match": "(</?)([a-zA-Z][\\w-]*)(\\s*/?>)",
+              "captures": {
+                "1": { "name": "punctuation.definition.tag.html.nubond" },
+                "2": { "name": "entity.name.tag.html.nubond" },
+                "3": { "name": "punctuation.definition.tag.html.nubond" }
+              }
+            }
+          ]
+        },
+        {
+          "comment": "this keyword",
+          "match": "\\bthis\\b",
+          "name": "variable.language.this.ts"
+        },
+        {
+          "comment": "Boolean literals",
+          "match": "\\b(true|false)\\b",
+          "name": "constant.language.boolean.ts"
+        },
+        {
+          "comment": "null / undefined",
+          "match": "\\b(null|undefined|NaN|Infinity)\\b",
+          "name": "constant.language.ts"
+        },
+        {
+          "comment": "Numeric literals",
+          "match": "\\b\\d+(\\.\\d+)?\\b",
+          "name": "constant.numeric.decimal.ts"
+        },
+        {
+          "comment": "Single-quoted strings inside double-quoted attribute values",
+          "match": "'[^']*'",
+          "name": "string.quoted.single.ts"
+        },
+        {
+          "comment": "JS keyword operators",
+          "match": "\\b(new|typeof|instanceof|void|delete|await)\\b",
+          "name": "keyword.operator.expression.ts"
+        },
+        {
+          "comment": "Arrow function: single parameter and arrow operator — e.g. el => expr",
+          "match": "(?<![.\\w$])([a-zA-Z_$][\\w$]*)\\s*(=>)",
+          "captures": {
+            "1": { "name": "variable.parameter.ts" },
+            "2": { "name": "storage.type.function.arrow.ts" }
+          }
+        },
+        {
+          "comment": "Arrow operator after parenthesized params: (a, b) =>",
+          "match": "=>",
+          "name": "storage.type.function.arrow.ts"
+        },
+        {
+          "comment": "HTML tags inside expression values (e.g., nb-html with inline markup)",
+          "match": "(</?)([a-zA-Z][\\w-]*)(\\s*/?>)",
+          "captures": {
+            "1": { "name": "punctuation.definition.tag.html.nubond" },
+            "2": { "name": "entity.name.tag.html.nubond" },
+            "3": { "name": "punctuation.definition.tag.html.nubond" }
+          }
+        },
+        {
+          "comment": "Multi-char operators",
+          "match": "===|!==|==|!=|<=|>=|&&|\\|\\||\\?\\?|\\?\\.|\\+\\+|--|\\.\\.\\.",
+          "name": "keyword.operator.ts"
+        },
+        {
+          "comment": "Single-char operators",
+          "match": "[=+\\-*/%<>!&|^~?:,;]",
+          "name": "keyword.operator.ts"
+        },
+        {
+          "comment": "Round brackets (parentheses)",
+          "match": "[()]",
+          "name": "meta.brace.round.ts"
+        },
+        {
+          "comment": "Square brackets",
+          "match": "[\\[\\]]",
+          "name": "meta.brace.square.ts"
+        },
+        {
+          "comment": "Curly braces",
+          "match": "[{}]",
+          "name": "punctuation.definition.block.ts"
+        },
+        {
+          "comment": "Object/style key before colon: {key: val} or key: val; (nb-class, nb-style)",
+          "match": "(?<![.\\w])([$a-zA-Z_][\\w$-]*)\\s*(?=:\\s+[^:])",
+          "captures": {
+            "1": { "name": "variable.other.object.property.ts" }
+          }
+        },
+        {
+          "comment": "Global runtime objects: console, document, window — scoped as variables to match TypeScript semantic highlighting",
+          "match": "(?<!\\.\\s*)(?<![a-zA-Z]\\s)\\b(console|document|window)\\b",
+          "name": "variable.other.object.ts"
+        },
+        {
+          "comment": "Built-in constructors / namespaces: Math, JSON, Object, etc.",
+          "match": "(?<!\\.\\s*)(?<![a-zA-Z]\\s)\\b(Math|JSON|Object|Array|Number|String|Date|Promise|Map|Set|RegExp|Error|Symbol)\\b",
+          "name": "support.class.ts"
+        },
+        {
+          "comment": "Standalone function calls: localize(...), dateFormat(...), customTransformer(...)",
+          "match": "(?<![.\\w$])([a-zA-Z_$][\\w$]*)(?=\\s*\\()",
+          "name": "entity.name.function.ts"
+        },
+        {
+          "comment": "Injected parameters (fixed names): item, index, count, element, event, etc.",
+          "match": "(?<!\\.\\s*)(?<![a-zA-Z]\\s)\\b(item|index|count|element|nativeElement|event|data|unSubscribe|router)\\b",
+          "name": "variable.parameter.ts"
+        },
+        {
+          "comment": "Prefixed repeat params: outerItem, innerIndex, myCount, etc.",
+          "match": "(?<!\\.\\s*)(?<![a-zA-Z]\\s)\\b([a-z][a-zA-Z]*(?:Item|Index|Count))\\b",
+          "name": "variable.parameter.ts"
+        },
+        {
+          "comment": "Method calls after dot: this.foo.bar()",
+          "match": "(?<=\\.)([$a-zA-Z_][\\w$]*)(?=\\s*\\()",
+          "name": "entity.name.function.member.ts"
+        },
+        {
+          "comment": "Property access after dot: this.foo, this.foo.bar",
+          "match": "(?<=\\.)([$a-zA-Z_][\\w$]*)",
+          "name": "variable.other.property.ts"
+        }
+      ]
+    }
+  }
+}

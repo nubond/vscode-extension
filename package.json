@@ -1,0 +1,154 @@
+{
+  "name": "nubond-language-service",
+  "displayName": "nuBond Language Service",
+  "description": "VS Code language service for the nuBond framework — IntelliSense, Go to Definition, Find References, Rename, hover docs, diagnostics, and CodeLens across HTML templates and their TypeScript classes.",
+  "version": "1.0.0",
+  "publisher": "nuBond",
+  "homepage": "https://github.com/nubond/vscode-extension",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nubond/vscode-extension.git"
+  },
+  "license": "MIT",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "nubond",
+    "language-service",
+    "language-server",
+    "intellisense",
+    "autocomplete",
+    "completion",
+    "hover",
+    "go-to-definition",
+    "find-references",
+    "rename",
+    "diagnostics",
+    "codelens",
+    "html-templates",
+    "typescript",
+    "data-binding",
+    "web-components"
+  ],
+  "activationEvents": [
+    "onLanguage:html",
+    "onLanguage:typescript",
+    "workspaceContains:**/*.html"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "typescriptServerPlugins": [
+      {
+        "name": "ts-plugin",
+        "enableForWorkspaceTypeScriptVersions": true
+      }
+    ],
+    "commands": [
+      {
+        "command": "nubond.goToTemplate",
+        "title": "Go to Template",
+        "category": "nuBond"
+      },
+      {
+        "command": "nubond.goToComponent",
+        "title": "Go to Component/Container",
+        "category": "nuBond"
+      },
+      {
+        "command": "nubond.restartServer",
+        "title": "Restart nuBond Language Server",
+        "category": "nuBond"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "when": "resourceLangId == html",
+          "command": "nubond.goToComponent",
+          "group": "navigation"
+        },
+        {
+          "when": "resourceLangId == typescript",
+          "command": "nubond.goToTemplate",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "nuBond Language Service",
+      "properties": {
+        "nubond.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable/disable the nuBond Language Service."
+        },
+        "nubond.diagnostics.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable/disable template diagnostics."
+        },
+        "nubond.codeLens.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable/disable CodeLens showing template reference counts."
+        },
+        "nubond.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces communication for debugging."
+        }
+      }
+    },
+    "grammars": [
+      {
+        "path": "./syntaxes/html.json",
+        "scopeName": "nubond.template",
+        "injectTo": [
+          "text.html.derivative",
+          "text.html.basic"
+        ]
+      },
+      {
+        "path": "./syntaxes/interpolation.json",
+        "scopeName": "nubond.interpolation",
+        "injectTo": [
+          "text.html.derivative",
+          "text.html.basic"
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "build:production": "node esbuild.js --production",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "watch": "tsc -w -p tsconfig.json",
+    "package": "npm run build:production && npx @vscode/vsce package",
+    "lint": "eslint src --ext ts",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "dependencies": {
+    "typescript": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.0.0",
+    "esbuild": "^0.27.4",
+    "jest": "^30.3.0",
+    "ts-jest": "^29.4.9"
+  }
+}
