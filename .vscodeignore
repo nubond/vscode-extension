@@ -9,3 +9,4 @@ features.md
 node_modules/**
 !node_modules/ts-plugin/**
 .gitignore
+coverage/
