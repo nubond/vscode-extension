@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://marketplace.visualstudio.com/items?itemName=nuBond.nubond-language-service"><img alt="Visual Studio Marketplace" src="https://img.shields.io/visual-studio-marketplace/v/nuBond.nubond-language-service.svg?label=marketplace"></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=nuBond.nubond-language-service"><img alt="Visual Studio Marketplace" src="https://vsmarketplacebadges.dev/version-short/nubond.nubond-language-service.svg?label=marketplace"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/npm/l/nubond.svg"></a>
   <img alt="coverage" src="https://img.shields.io/badge/coverage-85%25-green.svg">
   <img alt="Made in Ukraine" src="https://img.shields.io/badge/Made_in-Ukraine-FFD800.svg?labelColor=0056B9">
@@ -24,7 +24,7 @@ Treats your `nb-*` bindings as a first-class language. Hover any attribute or ex
 
 ## Installation
 
-> If you scaffolded your project from [`npm create nubond`](https://www.npmjs.com/package/create-nubond), this extension is recommended automatically when you open the workspace.
+> If you scaffolded your project from [`npm create nubond`](https://github.com/nubond/create-nubond), this extension is recommended automatically when you open the workspace.
 
 1. Open the Extensions panel in VS Code (`Ctrl+Shift+X` / `Cmd+Shift+X`).
 2. Search for **nuBond Language Service**.
