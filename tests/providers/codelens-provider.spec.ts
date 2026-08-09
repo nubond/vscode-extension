@@ -59,6 +59,22 @@ describe('nCodeLensProvider', () => {
         expect(result).toBeUndefined();
     });
 
+    // ---- Regression: analyzer paths are forward-slash-normalized while
+    // workspace folder fsPaths are native — the prefix never matched on
+    // Windows, so the lens title degraded to the bare file name. ----
+    it('should render workspace-relative template paths across slash styles', () => {
+        const previousFolders = (vscode.workspace as any).workspaceFolders;
+        (vscode.workspace as any).workspaceFolders = [
+            { uri: (vscode as any).Uri.file('D:/work/proj'), name: 'proj', index: 0 },
+        ];
+        try {
+            const rel = (provider as any).getRelativePath('d:/work/proj/src/app/template.html');
+            expect(rel).toBe('src/app/template.html');
+        } finally {
+            (vscode.workspace as any).workspaceFolders = previousFolders;
+        }
+    });
+
     it('should provide CodeLenses for associated TS class', () => {
         analyzer.analyzeSourceText('/test/container.ts', containerSource);
 
@@ -306,5 +322,28 @@ describe('nCodeLensProvider', () => {
         } finally {
             readSpy.mockRestore();
         }
+    });
+
+    // ---- Regression: '@' constant literals are not references ----
+    // The runtime never evaluates '@'-prefixed values — counting them
+    // inflated the "N template references" lens and pointed it at literals.
+    it('does not count member references inside @ constant literals', () => {
+        analyzer.analyzeSourceText('/test/container.ts', containerSource);
+        const htmlPath = analyzer.getAllAssociations()[0]!.htmlFilePath!;
+        htmlMocks[htmlPath] =
+            '<div nb-value="this.name"></div><span nb-value="@this.name is literal"></span>';
+
+        const doc = createMockDocument(containerSource, '/test/container.ts', 'typescript');
+        const result = provider.provideCodeLenses(doc, token as any);
+        expect(result).toBeDefined();
+
+        const nameLens = result!.find(l =>
+            l.command?.command === 'editor.action.showReferences' &&
+            (l.command?.title ?? '').includes('template reference'));
+        expect(nameLens).toBeDefined();
+        // Exactly ONE reference — the evaluated binding; the literal is skipped
+        expect(nameLens!.command!.title).toContain('1 template reference');
+        const locations = nameLens!.command!.arguments![2];
+        expect(locations).toHaveLength(1);
     });
 });

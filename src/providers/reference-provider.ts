@@ -7,11 +7,11 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import { logError } from '../core/logger';
-import { parseTemplate, findBindingAtOffset } from '../core/template-parser';
+import { parseTemplate, findBindingAtOffset, isEvaluatedBinding } from '../core/template-parser';
 import { parseTemplateCached } from '../core/template-parser-cache';
 import { parseExpression, findMemberAtOffset, MemberReference } from '../core/expression-parser';
 import { DecoratorAnalyzer } from '../core/decorator-analyzer';
-import { buildLineIndex, offsetToLineChar, getAbsoluteMemberRange, arePathsEqual } from '../core/utils';
+import { buildLineIndex, offsetToLineChar, getAbsoluteMemberRange, getChainIndexAtOffset, arePathsEqual } from '../core/utils';
 
 export class nReferenceProvider implements vscode.ReferenceProvider {
     constructor(private analyzer: DecoratorAnalyzer) {}
@@ -42,14 +42,25 @@ export class nReferenceProvider implements vscode.ReferenceProvider {
         if (!hit || !hit.inValue) return undefined;
 
         const { binding } = hit;
+        // '@' constants / '%' route slots are literal text at runtime — a
+        // `this.member` inside them is not a reference.
+        if (!isEvaluatedBinding(binding)) return undefined;
+
         const offsetInValue = offset - binding.valueSpan.start;
-        const prefixLen = binding.expressionPrefix ? 1 : 0;
-        const exprOffset = offsetInValue - prefixLen;
+        const exprOffset = offsetInValue - binding.expressionOffset;
         if (exprOffset < 0) return undefined;
 
         const exprInfo = parseExpression(binding.expression, binding.expressionPrefix);
         const memberRef = findMemberAtOffset(exprInfo, exprOffset);
         if (!memberRef) return undefined;
+
+        // Only the ROOT member's references can be answered from here. With
+        // the cursor on `name` in `this.user.name`, answering with the ROOT's
+        // occurrences reported the wrong symbol confidently — decline instead
+        // (same rule rename applies; chained members live on interface/alias
+        // declarations this provider cannot fan out over).
+        const chainIndex = getChainIndexAtOffset(memberRef.chain, memberRef.start, exprOffset, memberRef.separators);
+        if (chainIndex > 0) return undefined;
 
         const locations: vscode.Location[] = [];
         const memberName = memberRef.rootMember;
@@ -63,25 +74,28 @@ export class nReferenceProvider implements vscode.ReferenceProvider {
         const normalize = (p: string) => p.replace(/\\/g, '/').toLowerCase();
 
         for (const assoc of associations) {
-            // Include TS declaration as reference
-            if (context.includeDeclaration) {
-                const member = this.analyzer.findMember(assoc, memberName);
-                if (member) {
-                    locations.push(new vscode.Location(
-                        vscode.Uri.file(assoc.tsFilePath),
-                        new vscode.Position(member.line, member.character)
-                    ));
-                }
+            const member = this.analyzer.findMember(assoc, memberName);
+
+            // Include TS declaration as reference. Inherited members carry
+            // base-class-file coordinates — pair them with the declaring
+            // file's URI (same rule as definition and rename providers).
+            if (context.includeDeclaration && member) {
+                locations.push(new vscode.Location(
+                    vscode.Uri.file(member.declaredIn ?? assoc.tsFilePath),
+                    new vscode.Position(member.line, member.character)
+                ));
             }
 
-            // Find references in the current HTML template AND in any other
-            // HTMLs associated with the same TS class — symmetric with rename.
-            // Without this, find-references reports fewer hits than rename
-            // would actually edit, which is surprising and error-prone.
-            const tsAssocs = this.analyzer.getAssociationsForTs(assoc.tsFilePath);
+            // Find references in the current HTML template AND in every
+            // template whose class shares this member DECLARATION — symmetric
+            // with rename, which fans out the same way (a base-class member
+            // is used from every subclass's template).
             const htmlPaths: string[] = [document.uri.fsPath];
-            for (const a of tsAssocs) {
-                if (a.htmlFilePath) htmlPaths.push(a.htmlFilePath);
+            if (member) {
+                const declFilePath = member.declaredIn ?? assoc.tsFilePath;
+                for (const a of this.analyzer.getAssociationsWithMember(memberName, declFilePath, member.offset)) {
+                    if (a.htmlFilePath) htmlPaths.push(a.htmlFilePath);
+                }
             }
 
             for (const htmlPath of htmlPaths) {
@@ -105,6 +119,8 @@ function findReferencesInDocument(document: vscode.TextDocument, memberName: str
     const locations: vscode.Location[] = [];
 
     for (const binding of parsed.allBindings) {
+        // Skip '@' constants / '%' route slots — literal text, not references
+        if (!isEvaluatedBinding(binding)) continue;
         const exprInfo = parseExpression(binding.expression, binding.expressionPrefix);
 
         for (const ref of exprInfo.memberReferences) {
@@ -144,6 +160,8 @@ function findReferencesInOtherHtml(htmlPath: string, memberName: string): vscode
     const locations: vscode.Location[] = [];
 
     for (const binding of parsed.allBindings) {
+        // Skip '@' constants / '%' route slots — literal text, not references
+        if (!isEvaluatedBinding(binding)) continue;
         const exprInfo = parseExpression(binding.expression, binding.expressionPrefix);
 
         for (const ref of exprInfo.memberReferences) {

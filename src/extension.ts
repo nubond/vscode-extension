@@ -7,7 +7,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { DecoratorAnalyzer } from './core/decorator-analyzer';
+import { DecoratorAnalyzer, clearTsConfigCache } from './core/decorator-analyzer';
 import { WorkspaceLanguageService } from './core/workspace-language-service';
 import { setLogger, logError } from './core/logger';
 import { nHoverProvider } from './providers/hover-provider';
@@ -20,6 +20,7 @@ import { nCodeLensProvider } from './providers/codelens-provider';
 import { nDocumentSymbolProvider } from './providers/document-symbols-provider';
 import { nDocumentHighlightProvider } from './providers/document-highlight-provider';
 import { nSemanticTokenProvider, SEMANTIC_TOKEN_LEGEND } from './providers/semantic-token-provider';
+import { isNubondLanguageServiceEnabled } from './core/workspace-detection';
 import { Constants } from './constants';
 
 const HTML_SELECTOR: vscode.DocumentSelector = { language: 'html', scheme: 'file' };
@@ -49,6 +50,18 @@ export function activate(context: vscode.ExtensionContext): void {
         // outliving the extension session in jest test environments.
         setLogger(log);
         context.subscriptions.push({ dispose: () => setLogger(() => { /* silent */ }) });
+
+        // Content-level activation gate. The `workspaceContains` activation event
+        // only narrows us to workspaces where `node_modules/nubond` exists; it
+        // can't read a JSON property. So confirm a package.json explicitly opts
+        // in via `"nubond": { "languageService": true }`. If none does, stay
+        // inert (like the `enable === false` path) — native HTML/TS features in
+        // unrelated projects are left completely untouched.
+        if (!isNubondLanguageServiceEnabled()) {
+            log(`No workspace package.json opts in to the ${Constants.DISPLAY_NAME} language service ` +
+                `("${Constants.INTERNAL_NAME}": { "languageService": true }) — staying inert.`);
+            return;
+        }
 
         log(`Activating ${Constants.DISPLAY_NAME} Language Service...`);
 
@@ -88,6 +101,16 @@ function activateInternal(context: vscode.ExtensionContext): void {
 
     const htmlWatcher = vscode.workspace.createFileSystemWatcher('**/*.html');
     htmlWatcher.onDidChange(() => { try { refreshDiagnostics(); } catch (err) { logError('htmlWatcher.onDidChange', err); } });
+    htmlWatcher.onDidCreate(() => { try { refreshDiagnostics(); } catch (err) { logError('htmlWatcher.onDidCreate', err); } });
+    htmlWatcher.onDidDelete(uri => {
+        try {
+            // Drop any diagnostics still attached to the deleted file —
+            // refresh() only re-validates open documents and would leave
+            // stale squiggles listed in the Problems panel.
+            diagnosticsProvider?.clearDocument(uri);
+            refreshDiagnostics();
+        } catch (err) { logError('htmlWatcher.onDidDelete', err); }
+    });
 
     // Re-analyze TS files on buffer edits (not just disk saves) so CodeLens positions stay current
     const tsDocChangeDisposable = vscode.workspace.onDidChangeTextDocument(e => {
@@ -137,11 +160,93 @@ function activateInternal(context: vscode.ExtensionContext): void {
         () => log(`${Constants.DISPLAY_NAME} Language Service activated.`),
         err => logError('initialScan.rejected', err)
     );
+
+    // Keep the ts-plugin informed about HTML files with unsaved changes
+    // (async, non-blocking — the TS extension may still be activating).
+    initTsPluginDirtyHtmlBridge(context).catch(err => logError('initTsPluginDirtyHtmlBridge', err));
+}
+
+// ---- ts-plugin bridge: dirty HTML tracking ----
+//
+// The ts-plugin folds HTML template rename locations into TS-side renames.
+// Both its offsets and tsserver's offset→position conversion read the HTML
+// from DISK — for a template with unsaved editor changes the positions are
+// stale and applying them would corrupt the buffer. The plugin therefore
+// skips files we report as dirty; this bridge pushes that set through the
+// TS extension's `configurePlugin` API whenever it changes.
+
+const dirtyHtmlFiles = new Set<string>();
+let tsPluginConfigApi: { configurePlugin(pluginId: string, configuration: unknown): void } | undefined;
+
+async function initTsPluginDirtyHtmlBridge(context: vscode.ExtensionContext): Promise<void> {
+    try {
+        // Accessed defensively — test environments mock 'vscode' without the
+        // `extensions` namespace, and the guard keeps activation resilient.
+        const extensionsNs = (vscode as any).extensions as typeof vscode.extensions | undefined;
+        const tsExtension = extensionsNs?.getExtension('vscode.typescript-language-features');
+        if (!tsExtension) return;
+        const exports: any = await tsExtension.activate();
+        const api = exports?.getAPI?.(0);
+        if (!api || typeof api.configurePlugin !== 'function') return;
+        tsPluginConfigApi = api;
+        context.subscriptions.push({ dispose: () => { tsPluginConfigApi = undefined; } });
+
+        const syncDocument = (doc: vscode.TextDocument): void => {
+            if (doc.languageId !== 'html' || doc.uri.scheme !== 'file') return;
+            const key = doc.uri.fsPath;
+            const changed = doc.isDirty ? !dirtyHtmlFiles.has(key) : dirtyHtmlFiles.delete(key);
+            if (doc.isDirty) dirtyHtmlFiles.add(key);
+            if (changed) pushDirtyHtmlFiles();
+        };
+
+        context.subscriptions.push(
+            vscode.workspace.onDidChangeTextDocument(e => {
+                try { syncDocument(e.document); } catch (err) { logError('dirtyHtmlBridge.onDidChangeTextDocument', err); }
+            }),
+            vscode.workspace.onDidSaveTextDocument(doc => {
+                try { syncDocument(doc); } catch (err) { logError('dirtyHtmlBridge.onDidSaveTextDocument', err); }
+            }),
+            vscode.workspace.onDidCloseTextDocument(doc => {
+                // A closed document's buffer is gone — disk is authoritative again.
+                try {
+                    if (dirtyHtmlFiles.delete(doc.uri.fsPath)) pushDirtyHtmlFiles();
+                } catch (err) { logError('dirtyHtmlBridge.onDidCloseTextDocument', err); }
+            })
+        );
+
+        // Seed with documents that are already dirty at activation time.
+        let seeded = false;
+        for (const doc of vscode.workspace.textDocuments) {
+            if (doc.languageId === 'html' && doc.uri.scheme === 'file' && doc.isDirty) {
+                dirtyHtmlFiles.add(doc.uri.fsPath);
+                seeded = true;
+            }
+        }
+        if (seeded) pushDirtyHtmlFiles();
+    } catch (err) {
+        // The TS extension is missing or exposes no plugin API — the plugin
+        // keeps its fail-open default (empty dirty set). Log and move on.
+        logError('initTsPluginDirtyHtmlBridge.setup', err);
+    }
+}
+
+function pushDirtyHtmlFiles(): void {
+    try {
+        tsPluginConfigApi?.configurePlugin('ts-plugin', { dirtyHtmlFiles: Array.from(dirtyHtmlFiles) });
+    } catch (err) {
+        logError('pushDirtyHtmlFiles', err);
+    }
 }
 
 export function deactivate(): void {
     // VS Code awaits this on shutdown; an exception here would block the
     // shutdown sequence for the extension host. Always succeed silently.
+    // Pending debounced re-analyses must not fire into disposed state
+    // (restartServer already clears them — deactivation has to as well).
+    try {
+        for (const timer of tsChangeTimers.values()) { clearTimeout(timer); }
+        tsChangeTimers.clear();
+    } catch { /* ignore */ }
     try { log(`${Constants.DISPLAY_NAME} Language Service deactivated.`); } catch { /* ignore */ }
 }
 
@@ -204,6 +309,13 @@ function onTsFileChanged(uri: vscode.Uri): void {
         return;
     }
 
+    // Declaration files are excluded from the initial scan too — the analyzer
+    // skips them anyway; feeding them to the LanguageService as root files
+    // just grows its root set for nothing.
+    if (filePath.endsWith('.d.ts')) {
+        return;
+    }
+
     // Debounce per file: rapid edits only trigger one re-analysis per file.
     const existingTimer = tsChangeTimers.get(filePath);
     if (typeof(existingTimer) !== 'undefined') {
@@ -259,6 +371,15 @@ function onTsFileDeleted(uri: vscode.Uri): void {
     // workspace silently un-watched until the user reloads. Wrap every step,
     // and log so the failure isn't invisible if it ever happens.
     const fp = uri?.fsPath ?? '<unknown>';
+    // Cancel any pending debounced re-analysis for the deleted file — letting
+    // it fire would re-register the path from a stale open buffer.
+    try {
+        const pending = tsChangeTimers.get(uri.fsPath);
+        if (typeof(pending) !== 'undefined') {
+            clearTimeout(pending);
+            tsChangeTimers.delete(uri.fsPath);
+        }
+    } catch (err) { logError(`onTsFileDeleted.cancelTimer(${fp})`, err); }
     try { analyzer.removeFile(uri.fsPath); } catch (err) { logError(`onTsFileDeleted.analyzer.removeFile(${fp})`, err); }
     try { workspaceLS.removeFile(uri.fsPath); } catch (err) { logError(`onTsFileDeleted.workspaceLS.removeFile(${fp})`, err); }
     try { codeLensProvider?.refresh(); } catch (err) { logError('onTsFileDeleted.codeLensProvider.refresh', err); }
@@ -375,6 +496,15 @@ function restartServer(): void {
     // user's workspace state. Wrap each tear-down step independently so a
     // failure mid-restart still ends in a clean (if empty) state.
     try { analyzer.clear(); } catch (err) { logError('restartServer.analyzer.clear', err); }
+    // Forget memoized tsconfig options — the whole point of a restart is to
+    // pick up project-level changes (e.g. an edited tsconfig.json) without a
+    // window reload.
+    try { clearTsConfigCache(); } catch (err) { logError('restartServer.clearTsConfigCache', err); }
+    // Cancel pending debounced re-analyses — they belong to the old state.
+    try {
+        for (const timer of tsChangeTimers.values()) { clearTimeout(timer); }
+        tsChangeTimers.clear();
+    } catch (err) { logError('restartServer.clearTimers', err); }
     try { workspaceLS.dispose(); } catch (err) { logError('restartServer.workspaceLS.dispose', err); }
     try { workspaceLS = new WorkspaceLanguageService(); } catch (err) {
         logError('restartServer.WorkspaceLanguageService.reinit', err);

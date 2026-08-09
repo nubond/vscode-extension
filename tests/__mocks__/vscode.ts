@@ -159,12 +159,22 @@ export enum SymbolKind {
 }
 
 export class WorkspaceEdit {
-    private _entries: Array<{ uri: Uri; edits: TextEdit[] }> = [];
+    private _byUri = new Map<string, { uri: Uri; edits: TextEdit[] }>();
     replace(uri: Uri, range: Range, newText: string): void {
-        this._entries.push({ uri, edits: [new TextEdit(range, newText)] });
+        const key = uri.toString();
+        const existing = this._byUri.get(key);
+        if (existing) {
+            existing.edits.push(new TextEdit(range, newText));
+        } else {
+            this._byUri.set(key, { uri, edits: [new TextEdit(range, newText)] });
+        }
     }
-    get entries() { return this._entries; }
-    get size() { return this._entries.length; }
+    /** Matches the real API: tuples of [uri, edits], grouped per resource. */
+    entries(): Array<[Uri, TextEdit[]]> {
+        return Array.from(this._byUri.values()).map(e => [e.uri, e.edits] as [Uri, TextEdit[]]);
+    }
+    /** Matches the real API: number of affected resources. */
+    get size() { return this._byUri.size; }
 }
 
 export class TextEdit {
@@ -219,6 +229,7 @@ export const workspace = {
     getConfiguration: jest.fn(() => ({
         get: jest.fn((key: string, defaultValue?: any) => defaultValue),
     })),
+    workspaceFolders: undefined as Array<{ uri: Uri; name: string; index: number }> | undefined,
     findFiles: jest.fn(() => Promise.resolve([])),
     textDocuments: [],
     openTextDocument: jest.fn((uri: any) => Promise.resolve({
@@ -235,6 +246,12 @@ export const workspace = {
     onDidChangeTextDocument: jest.fn(),
     onDidOpenTextDocument: jest.fn(),
     onDidCloseTextDocument: jest.fn(),
+    onDidSaveTextDocument: jest.fn(),
+};
+
+export const extensions = {
+    // Default: TS extension not present — the ts-plugin bridge stays inert.
+    getExtension: jest.fn(() => undefined),
 };
 
 export const window = {
@@ -251,6 +268,8 @@ export const window = {
 
 export const commands = {
     registerCommand: jest.fn(),
+    // Default: no provider available — callers (rename delegation) fall back.
+    executeCommand: jest.fn(() => Promise.resolve(undefined)),
 };
 
 export class SnippetString {

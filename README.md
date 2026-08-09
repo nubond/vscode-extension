@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://marketplace.visualstudio.com/items?itemName=nuBond.nubond-language-service"><img alt="Visual Studio Marketplace" src="https://vsmarketplacebadges.dev/version-short/nubond.nubond-language-service.svg?label=marketplace"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/npm/l/nubond.svg"></a>
-  <img alt="coverage" src="https://img.shields.io/badge/coverage-85%25-green.svg">
+  <img alt="coverage" src="https://img.shields.io/badge/coverage-91%25-brightgreen.svg">
   <img alt="Made in Ukraine" src="https://img.shields.io/badge/Made_in-Ukraine-FFD800.svg?labelColor=0056B9">
 </p>
 
@@ -24,7 +24,7 @@ Treats your `nb-*` bindings as a first-class language. Hover any attribute or ex
 
 ## Installation
 
-> If you scaffolded your project from [`npm create nubond`](https://github.com/nubond/create-nubond), this extension is recommended automatically when you open the workspace.
+> If you scaffolded your project from [`npm create nubond`](https://github.com/nubond/create-nubond), the workspace is already opted in (see below) — just install the extension.
 
 1. Open the Extensions panel in VS Code (`Ctrl+Shift+X` / `Cmd+Shift+X`).
 2. Search for **nuBond Language Service**.
@@ -36,7 +36,19 @@ Or from the command line:
 code --install-extension nuBond.nubond-language-service
 ```
 
-The service activates on any HTML or TypeScript file, or any workspace that contains HTML.
+### Enabling the language service
+
+The extension wakes on any HTML or TypeScript file, but it stays inert until the workspace opts in. To enable it, add a `nubond` marker to the `package.json` at the root of your workspace folder:
+
+```json
+{
+  "nubond": {
+    "languageService": true
+  }
+}
+```
+
+Without this marker the extension does no work in the workspace (no providers, no scanning), so it can stay installed globally without affecting non-nuBond projects. Projects scaffolded with `npm create nubond` include the marker out of the box.
 
 ## Features
 
@@ -56,7 +68,7 @@ The service activates on any HTML or TypeScript file, or any workspace that cont
 
 ## Commands
 
-Available from the Command Palette under the **nuBond** category, and from the editor context menu.
+Available from the Command Palette under the **nuBond** category; the two *Go to* commands also appear in the editor context menu (on HTML and TypeScript files respectively).
 
 | Command | What it does |
 |---|---|
@@ -76,6 +88,7 @@ Available from the Command Palette under the **nuBond** category, and from the e
 ## Requirements
 
 - VS Code 1.85.0 or later.
+- A workspace-folder-root `package.json` with `"nubond": { "languageService": true }` (see [Enabling the language service](#enabling-the-language-service)).
 - A workspace containing nuBond `@Container` / `@Component` classes paired with HTML templates (W3C-compliant `data-nb-*` syntax also supported).
 
 ## License

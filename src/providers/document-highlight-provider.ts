@@ -6,10 +6,10 @@
 
 import * as vscode from 'vscode';
 import { logError } from '../core/logger';
-import { findBindingAtOffset } from '../core/template-parser';
+import { findBindingAtOffset, isEvaluatedBinding } from '../core/template-parser';
 import { parseTemplateCached } from '../core/template-parser-cache';
 import { parseExpression, findMemberAtOffset } from '../core/expression-parser';
-import { getAbsoluteMemberRange } from '../core/utils';
+import { getAbsoluteMemberRange, getChainIndexAtOffset } from '../core/utils';
 
 export class nDocumentHighlightProvider implements vscode.DocumentHighlightProvider {
     provideDocumentHighlights(
@@ -36,19 +36,29 @@ export class nDocumentHighlightProvider implements vscode.DocumentHighlightProvi
         if (!hit || !hit.inValue) return undefined;
 
         const { binding } = hit;
+        // '@' constants / '%' route slots are literal text — nothing to highlight
+        if (!isEvaluatedBinding(binding)) return undefined;
+
         const offsetInValue = offset - binding.valueSpan.start;
-        const prefixLen = binding.expressionPrefix ? 1 : 0;
-        const exprOffset = offsetInValue - prefixLen;
+        const exprOffset = offsetInValue - binding.expressionOffset;
         if (exprOffset < 0) return undefined;
 
         const exprInfo = parseExpression(binding.expression, binding.expressionPrefix);
         const memberRef = findMemberAtOffset(exprInfo, exprOffset);
         if (!memberRef) return undefined;
 
+        // Highlights are root-member based. With the cursor on a CHAINED
+        // segment (`name` in this.user.name), highlighting every root
+        // occurrence marked the wrong symbol — decline instead.
+        const chainIndex = getChainIndexAtOffset(memberRef.chain, memberRef.start, exprOffset, memberRef.separators);
+        if (chainIndex > 0) return undefined;
+
         const memberName = memberRef.rootMember;
         const highlights: vscode.DocumentHighlight[] = [];
 
         for (const b of parsed.allBindings) {
+            // Skip '@' constants / '%' route slots — literal text
+            if (!isEvaluatedBinding(b)) continue;
             const info = parseExpression(b.expression, b.expressionPrefix);
 
             for (const ref of info.memberReferences) {

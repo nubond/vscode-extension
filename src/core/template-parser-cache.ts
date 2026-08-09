@@ -19,7 +19,8 @@ interface CacheEntry {
 }
 
 // WeakMap so cache entries are released when their TextDocument is GC'd.
-const docCache = new WeakMap<TextDocument, CacheEntry>();
+// `let` (not const) so the test-only clear helper can actually drop it.
+let docCache = new WeakMap<TextDocument, CacheEntry>();
 
 /**
  * Parse `document` and return a cached `ParsedTemplate`. Subsequent calls for
@@ -41,6 +42,8 @@ export function parseTemplateCached(document: TextDocument): ParsedTemplate {
  * need this — versions monotonically increase per document.
  */
 export function _clearTemplateCacheForTest(): void {
-    // WeakMap has no `clear`; replace by losing the only reference. Tests
-    // should generally just create new TextDocument instances instead.
+    // WeakMap has no `clear`; replace it so the old entries lose their only
+    // reference. Tests should generally just create new TextDocument
+    // instances instead.
+    docCache = new WeakMap<TextDocument, CacheEntry>();
 }

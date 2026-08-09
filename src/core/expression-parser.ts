@@ -57,35 +57,180 @@ export function parseExpression(rawValue: string, prefix?: string): ExpressionIn
 }
 
 /**
+ * Replace non-code spans of an expression with spaces, preserving length and
+ * offsets: string literal contents, template-literal text (the `${ … }`
+ * interiors stay live — they are code), block comments, and line comments.
+ * `this.x` inside a string literal is prose, not a member reference —
+ * extracting it produced false diagnostics and rename edits inside strings.
+ *
+ * Exported so providers doing their own identifier scans (semantic tokens)
+ * share the exact same notion of "code" instead of re-implementing it.
+ */
+export function maskNonCode(expression: string): string {
+    const chars = expression.split('');
+    const n = expression.length;
+    const blank = (from: number, to: number): void => {
+        for (let k = from; k < to && k < n; k++) {
+            if (chars[k] !== '\n') chars[k] = ' ';
+        }
+    };
+
+    // Template-literal state. `${ … }` interiors are code and can themselves
+    // contain strings, comments, and whole nested templates — the previous
+    // brace-depth-only skip left those inner literals unmasked (phantom
+    // member references) and miscounted braces inside strings. Each stack
+    // entry is the '{' depth of one open interpolation, so a '}' is
+    // attributed to either the interpolation close or an object literal
+    // inside it.
+    const interpolationDepths: number[] = [];
+    let inTemplateText = false;
+
+    let i = 0;
+    while (i < n) {
+        const ch = expression[i];
+
+        if (inTemplateText) {
+            if (ch === '\\') {
+                chars[i] = ' ';
+                if (i + 1 < n && chars[i + 1] !== '\n') chars[i + 1] = ' ';
+                i += 2;
+                continue;
+            }
+            if (ch === '`') { inTemplateText = false; i++; continue; }
+            if (ch === '$' && expression[i + 1] === '{') {
+                interpolationDepths.push(0);
+                inTemplateText = false;
+                i += 2;
+                continue;
+            }
+            if (chars[i] !== '\n') chars[i] = ' ';
+            i++;
+            continue;
+        }
+
+        if (ch === "'" || ch === '"') {
+            const start = i;
+            i++;
+            while (i < n && expression[i] !== ch) {
+                if (expression[i] === '\\') i++;
+                i++;
+            }
+            i++; // closing quote (or past end)
+            blank(start + 1, Math.min(i - 1, n));
+            continue;
+        }
+
+        if (ch === '/' && expression[i + 1] === '*') {
+            const start = i;
+            const close = expression.indexOf('*/', i + 2);
+            const end = close === -1 ? n : close + 2;
+            blank(start, end);
+            i = end;
+            continue;
+        }
+
+        if (ch === '/' && expression[i + 1] === '/') {
+            const start = i;
+            let end = expression.indexOf('\n', i);
+            if (end === -1) end = n;
+            blank(start, end);
+            i = end;
+            continue;
+        }
+
+        // Regex literal. A '/' that isn't a comment is either division or a
+        // regex — decided (like JS lexers do) by what precedes it: after a
+        // value (identifier, ')', ']', number…) it's division; after an
+        // operator/opening bracket/start it's a regex. Without this, a quote
+        // or '//' INSIDE a regex ( /['"]/ ) derailed the string/comment
+        // scanners and blanked live code after the literal.
+        if (ch === '/' && regexCanStartHere(chars, i)) {
+            const close = findRegexEnd(expression, i);
+            if (close !== -1) {
+                blank(i + 1, close); // keep the delimiters, blank the pattern
+                // Blank the flags too — 'g'/'i' would read as identifiers.
+                let k = close + 1;
+                while (k < n && /[a-z]/i.test(expression[k])) { chars[k] = ' '; k++; }
+                i = k;
+                continue;
+            }
+        }
+
+        if (ch === '`') {
+            inTemplateText = true;
+            i++;
+            continue;
+        }
+
+        if (interpolationDepths.length > 0 && (ch === '{' || ch === '}')) {
+            const top = interpolationDepths.length - 1;
+            if (ch === '{') {
+                interpolationDepths[top]++;
+            } else if (interpolationDepths[top] === 0) {
+                // Interpolation closed — back to masking the template's text
+                interpolationDepths.pop();
+                inTemplateText = true;
+            } else {
+                interpolationDepths[top]--;
+            }
+            i++;
+            continue;
+        }
+
+        i++;
+    }
+
+    return chars.join('');
+}
+
+/**
+ * True when a '/' at index `i` can begin a regex literal: at expression start
+ * or after an operator / opening bracket / separator. After a value token
+ * (identifier char, ')', ']', quote) it's division. Checked against the
+ * masked-so-far `chars` so already-blanked regions read as spaces.
+ */
+function regexCanStartHere(chars: string[], i: number): boolean {
+    for (let k = i - 1; k >= 0; k--) {
+        const c = chars[k];
+        if (c === ' ' || c === '\t' || c === '\n' || c === '\r') continue;
+        return '([{,;=:!&|?+-*%^~<>'.includes(c);
+    }
+    return true; // start of expression
+}
+
+/**
+ * Index of the unescaped closing '/' of a regex literal starting at `start`,
+ * honoring character classes ('/' inside [...] does not terminate). Returns
+ * -1 when unterminated (or broken by a newline) — the caller then treats the
+ * '/' as division rather than masking to end-of-input.
+ */
+function findRegexEnd(expression: string, start: number): number {
+    let inClass = false;
+    for (let j = start + 1; j < expression.length; j++) {
+        const c = expression[j];
+        if (c === '\\') { j++; continue; }
+        if (c === '\n') return -1;
+        if (c === '[') inClass = true;
+        else if (c === ']') inClass = false;
+        else if (c === '/' && !inClass) return j;
+    }
+    return -1;
+}
+
+/**
  * Extract all `this.X` member access references from an expression.
  */
 function extractMemberReferences(expression: string): MemberReference[] {
     const refs: MemberReference[] = [];
-    // Build a set of ranges covered by block comments to skip
-    const commentRanges: { start: number; end: number }[] = [];
-    let ci = 0;
-    while (ci < expression.length - 1) {
-        if (expression[ci] === '/' && expression[ci + 1] === '*') {
-            const closeIdx = expression.indexOf('*/', ci + 2);
-            const end = closeIdx >= 0 ? closeIdx + 2 : expression.length;
-            commentRanges.push({ start: ci, end });
-            ci = end;
-        } else {
-            ci++;
-        }
-    }
+    // Run the scan over a masked copy (same length, so all offsets are valid
+    // in the original): string/template-literal text and comments blanked.
+    const masked = maskNonCode(expression);
 
     // Match `this.` followed by identifier chains (supports both `.` and `?.` separators)
     const regex = /\bthis\.([$\w]+(?:\?\.[$\w]+|(?<!\?)(?:\.[$\w]+))*)\s*(\()?/g;
     let match: RegExpExecArray | null;
 
-    while ((match = regex.exec(expression)) !== null) {
-        // Skip matches inside block comments
-        const matchStart = match.index;
-        const matchEnd = match.index + match[0].length;
-        const inComment = commentRanges.some(r => matchStart >= r.start && matchEnd <= r.end);
-        if (inComment) continue;
-
+    while ((match = regex.exec(masked)) !== null) {
         const fullChain = match[1];
         const isMethodCall = match[2] === '(';  // Note: match[2] is now capture group 2
         // Split on `?.` or `.` while tracking separator widths

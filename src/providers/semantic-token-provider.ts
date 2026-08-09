@@ -8,6 +8,7 @@ import * as vscode from 'vscode';
 import { logError } from '../core/logger';
 import { getAllLocalVars, getAllRepeatScopes, ParsedTemplate, TemplateAttribute } from '../core/template-parser';
 import { parseTemplateCached } from '../core/template-parser-cache';
+import { maskNonCode } from '../core/expression-parser';
 import { DecoratorAnalyzer } from '../core/decorator-analyzer';
 
 const TOKEN_TYPE_VARIABLE = 0;
@@ -58,18 +59,25 @@ export class nSemanticTokenProvider implements vscode.DocumentSemanticTokensProv
         binding: TemplateAttribute,
         builder: vscode.SemanticTokensBuilder
     ): void {
-        const prefixLen = binding.expressionPrefix ? 1 : 0;
         // Skip @literal and %slot expressions — they contain no variable references
         if (binding.expressionPrefix === '@' || binding.expressionPrefix === '%') return;
 
         const expression = binding.expression;
-        const exprStart = binding.valueSpan.start + prefixLen;
+        // Scan a masked copy (same length, so every index maps 1:1 into the
+        // original): string/template-literal text and comments must not
+        // produce variable tokens — `'no item here'` highlighted `item`.
+        const searchText = maskNonCode(expression);
+        const exprStart = binding.valueSpan.start + binding.expressionOffset;
 
         // Collect all variable names visible at this binding's location
         const varNames = new Set<string>();
 
-        // nb-var locals
-        const localVars = getAllLocalVars(parsed, binding.nameSpan.start);
+        // nb-var locals. The consumer-aware overload applies the runtime
+        // gating rules — an nb-repeat's own expression and nb-case/nb-default
+        // expressions never see the element's own vars, and the first nb-var
+        // on an element sees no sibling vars, so those names must not be
+        // highlighted as live variables there.
+        const localVars = getAllLocalVars(parsed, binding.nameSpan.start, binding);
         for (const v of localVars) {
             // Skip empty names — a mid-edit `nb-var:` with no suffix would
             // otherwise cause `expression.indexOf('', …)` below to return 0
@@ -77,17 +85,23 @@ export class nSemanticTokenProvider implements vscode.DocumentSemanticTokensProv
             if (v.varName) varNames.add(v.varName);
         }
 
-        // nb-repeat params
-        const repeatScopes = getAllRepeatScopes(parsed, binding.nameSpan.start);
+        // nb-repeat params. Prefixed scopes inject ONLY the camelCase
+        // prefixed names — highlighting 'outeritem' would mark an identifier
+        // that doesn't exist at runtime as a known variable. An nb-repeat's
+        // OWN expression runs with the parent params, so its own scope's
+        // names are not live there.
+        const ownRepeat = binding.baseName === 'nb-repeat' ? binding : undefined;
+        const repeatScopes = getAllRepeatScopes(parsed, binding.nameSpan.start, ownRepeat);
         for (const scope of repeatScopes) {
-            const prefix = scope.prefix ?? '';
-            varNames.add(prefix + 'item');
-            varNames.add(prefix + 'index');
-            varNames.add(prefix + 'count');
+            const prefix = scope.prefix;
             if (prefix) {
                 varNames.add(prefix + 'Item');
                 varNames.add(prefix + 'Index');
                 varNames.add(prefix + 'Count');
+            } else {
+                varNames.add('item');
+                varNames.add('index');
+                varNames.add('count');
             }
         }
 
@@ -102,7 +116,7 @@ export class nSemanticTokenProvider implements vscode.DocumentSemanticTokensProv
         // Detect arrow function parameters: identifier => ...
         const arrowParamRegex = /(?<![.\w$])([a-zA-Z_$][\w$]*)\s*=>/g;
         let arrowMatch: RegExpExecArray | null;
-        while ((arrowMatch = arrowParamRegex.exec(expression)) !== null) {
+        while ((arrowMatch = arrowParamRegex.exec(searchText)) !== null) {
             varNames.add(arrowMatch[1]);
         }
 
@@ -123,18 +137,19 @@ export class nSemanticTokenProvider implements vscode.DocumentSemanticTokensProv
         for (const [name, tokenType] of allNames) {
             if (!name) continue; // defensive: indexOf('', …) never advances
             let searchFrom = 0;
-            while (searchFrom < expression.length) {
-                const idx = expression.indexOf(name, searchFrom);
+            while (searchFrom < searchText.length) {
+                const idx = searchText.indexOf(name, searchFrom);
                 if (idx === -1) break;
 
                 const endIdx = idx + name.length;
 
                 // Check word boundaries
-                const charBefore = idx > 0 ? expression[idx - 1] : ' ';
-                const charAfter = endIdx < expression.length ? expression[endIdx] : ' ';
+                const charBefore = idx > 0 ? searchText[idx - 1] : ' ';
+                const charAfter = endIdx < searchText.length ? searchText[endIdx] : ' ';
 
                 // Must not be preceded by dot (property access) or be part of a larger identifier
-                if (!isIdentChar(charBefore) && charBefore !== '.' && !isIdentChar(charAfter)) {
+                if (!isIdentChar(charBefore) && charBefore !== '.' && !isIdentChar(charAfter) &&
+                    !isObjectKeyPosition(searchText, idx, endIdx)) {
                     const absoluteOffset = exprStart + idx;
                     const pos = document.positionAt(absoluteOffset);
                     builder.push(pos.line, pos.character, name.length, tokenType, 0);
@@ -148,4 +163,18 @@ export class nSemanticTokenProvider implements vscode.DocumentSemanticTokensProv
 
 function isIdentChar(ch: string): boolean {
     return /[\w$]/.test(ch);
+}
+
+/**
+ * True when the identifier at [idx, endIdx) is in object-literal KEY position
+ * (`{item: 1}`, `{a, item: 2}`, nb-class's `{active: x; item: y}`) — a
+ * property name, not a use of the variable. Ternaries stay highlighted: in
+ * `cond ? item : other` the char before `item` is `?`, not a key delimiter.
+ * Same rule the diagnostics provider's findIdentifierValueIndex applies.
+ */
+function isObjectKeyPosition(code: string, idx: number, endIdx: number): boolean {
+    const after = code.substring(endIdx).match(/^\s*(.)/)?.[1];
+    if (after !== ':') return false;
+    const before = code.substring(0, idx).match(/(\S)\s*$/)?.[1];
+    return before === undefined || before === '{' || before === ',' || before === ';';
 }

@@ -41,13 +41,19 @@ export class nDocumentSymbolProvider implements vscode.DocumentSymbolProvider {
     private buildSymbols(document: vscode.TextDocument, element: TemplateElement): vscode.DocumentSymbol[] {
         const symbols: vscode.DocumentSymbol[] = [];
 
+        // The symbol's full range must span the WHOLE element (through its
+        // closing tag) — child symbols get nested below, and VS Code requires
+        // children's ranges to be contained in the parent's range. Using only
+        // the opening tag broke that contract (breadcrumb/outline glitches).
+        const elementEnd = Math.max(element.elementEnd, element.tagSpan.end);
+
         for (const attr of element.nbAttributes) {
             const meta = describeAttribute(attr);
             if (!meta) continue;
 
             const fullRange = new vscode.Range(
                 document.positionAt(element.tagSpan.start),
-                document.positionAt(element.tagSpan.end)
+                document.positionAt(elementEnd)
             );
             const selectionRange = new vscode.Range(
                 document.positionAt(attr.nameSpan.start),

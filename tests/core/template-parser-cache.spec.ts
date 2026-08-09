@@ -1,4 +1,4 @@
-import { parseTemplateCached } from '../../src/core/template-parser-cache';
+import { parseTemplateCached, _clearTemplateCacheForTest } from '../../src/core/template-parser-cache';
 import { createMockDocument } from '../helpers';
 import * as templateParser from '../../src/core/template-parser';
 
@@ -8,6 +8,16 @@ describe('parseTemplateCached', () => {
         const a = parseTemplateCached(doc);
         const b = parseTemplateCached(doc);
         expect(a).toBe(b);
+    });
+
+    it('_clearTemplateCacheForTest actually drops cached entries', () => {
+        // Round 3 nit: the helper was a documented no-op (docCache was a
+        // const that was never reassigned).
+        const doc = createMockDocument('<div nb-value="this.foo"></div>');
+        const a = parseTemplateCached(doc);
+        _clearTemplateCacheForTest();
+        const b = parseTemplateCached(doc);
+        expect(b).not.toBe(a);
     });
 
     it('reparses when the document version changes', () => {

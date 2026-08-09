@@ -7,7 +7,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { parseTemplate } from '../core/template-parser';
+import { parseTemplate, isEvaluatedBinding } from '../core/template-parser';
 import { parseExpression } from '../core/expression-parser';
 import { DecoratorAnalyzer, TemplateAssociation } from '../core/decorator-analyzer';
 import { buildLineIndex, offsetToLineChar, getAbsoluteMemberRange, arePathsEqual } from '../core/utils';
@@ -60,7 +60,10 @@ export class nCodeLensProvider implements vscode.CodeLensProvider, vscode.Dispos
 
             if (!assoc.htmlFilePath) continue;
 
-            const publicMembers = assoc.members.filter(m => m.isPublic);
+            // Inherited members (declaredIn set) live in another file — their
+            // positions are meaningless in THIS document; a lens belongs on
+            // the declaring base class instead.
+            const publicMembers = assoc.members.filter(m => m.isPublic && !m.declaredIn);
             if (publicMembers.length === 0) continue;
 
             // Parse the HTML template ONCE for all members (avoids N×readSync per member)
@@ -138,6 +141,9 @@ export class nCodeLensProvider implements vscode.CodeLensProvider, vscode.Dispos
         const memberSet = new Set(memberNames);
 
         for (const binding of parsed.allBindings) {
+            // '@' constants / '%' route slots are literal text — counting
+            // them inflated the lens and pointed it at non-references.
+            if (!isEvaluatedBinding(binding)) continue;
             const exprInfo = parseExpression(binding.expression, binding.expressionPrefix);
             for (const ref of exprInfo.memberReferences) {
                 if (memberSet.has(ref.rootMember)) {
@@ -159,12 +165,16 @@ export class nCodeLensProvider implements vscode.CodeLensProvider, vscode.Dispos
     }
 
     private getRelativePath(filePath: string): string {
+        // Analyzer paths are forward-slash-normalized while folder fsPaths are
+        // native (backslash on Windows) — compare slash-agnostically and
+        // case-insensitively or the prefix never matches on Windows.
+        const fileNorm = filePath.replace(/\\/g, '/');
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (workspaceFolders) {
             for (const folder of workspaceFolders) {
-                const folderPath = folder.uri.fsPath;
-                if (filePath.startsWith(folderPath)) {
-                    return filePath.substring(folderPath.length + 1).replace(/\\/g, '/');
+                const folderNorm = folder.uri.fsPath.replace(/\\/g, '/');
+                if (fileNorm.toLowerCase().startsWith(folderNorm.toLowerCase() + '/')) {
+                    return fileNorm.substring(folderNorm.length + 1);
                 }
             }
         }

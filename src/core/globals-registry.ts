@@ -18,6 +18,16 @@ export interface GlobalObject {
     members: GlobalMember[];
 }
 
+/**
+ * Framework note appended to async APIs: their callbacks run OUTSIDE
+ * nuBond's change-detection triggers. An `nb-event` handler that RETURNS a
+ * Promise gets a detection cycle when it settles, but state changed inside a
+ * timer / fetch / rAF callback only reaches the UI when it is assigned to an
+ * `@Detector` property (deep-unequal) or `ChangeDetector.detect()` is called.
+ */
+const ASYNC_CALLBACK_NOTE =
+    'Framework note: the callback runs outside nuBond change detection — assign `@Detector` properties or call `ChangeDetector.detect()` there so the UI updates.';
+
 const CONSOLE_MEMBERS: GlobalMember[] = [
     { name: 'log', type: '(...data: any[]) => void', desc: 'Log a message to the console', kind: 'method' },
     { name: 'warn', type: '(...data: any[]) => void', desc: 'Log a warning message', kind: 'method' },
@@ -180,22 +190,57 @@ const WINDOW_MEMBERS: GlobalMember[] = [
     { name: 'screen', type: 'Screen', desc: 'Screen information', kind: 'property' },
     { name: 'alert', type: '(message?: any) => void', desc: 'Show an alert dialog', kind: 'method' },
     { name: 'confirm', type: '(message?: string) => boolean', desc: 'Show a confirmation dialog', kind: 'method' },
-    { name: 'prompt', type: '(message?: string, default?: string) => string | null', desc: 'Show a prompt dialog', kind: 'method' },
+    { name: 'prompt', type: '(message?: string, defaultValue?: string) => string | null', desc: 'Show a prompt dialog', kind: 'method' },
     { name: 'open', type: '(url?: string, target?: string, features?: string) => Window | null', desc: 'Open a new browser window', kind: 'method' },
     { name: 'close', type: '() => void', desc: 'Close the window', kind: 'method' },
     { name: 'scrollTo', type: '(x: number, y: number) => void', desc: 'Scroll to a position', kind: 'method' },
     { name: 'scrollBy', type: '(x: number, y: number) => void', desc: 'Scroll by a delta', kind: 'method' },
     { name: 'getComputedStyle', type: '(element: Element) => CSSStyleDeclaration', desc: 'Get computed styles for an element', kind: 'method' },
-    { name: 'requestAnimationFrame', type: '(callback: FrameRequestCallback) => number', desc: 'Request a callback before next repaint', kind: 'method' },
+    { name: 'requestAnimationFrame', type: '(callback: FrameRequestCallback) => number', desc: `Request a callback before next repaint. ${ASYNC_CALLBACK_NOTE}`, kind: 'method' },
     { name: 'cancelAnimationFrame', type: '(handle: number) => void', desc: 'Cancel a requested animation frame', kind: 'method' },
-    { name: 'setTimeout', type: '(handler: Function, timeout?: number) => number', desc: 'Execute a function after a delay', kind: 'method' },
+    { name: 'setTimeout', type: '(handler: Function, timeout?: number) => number', desc: `Execute a function after a delay. ${ASYNC_CALLBACK_NOTE}`, kind: 'method' },
     { name: 'clearTimeout', type: '(id: number) => void', desc: 'Cancel a timeout', kind: 'method' },
-    { name: 'setInterval', type: '(handler: Function, timeout?: number) => number', desc: 'Execute a function repeatedly at intervals', kind: 'method' },
+    { name: 'setInterval', type: '(handler: Function, timeout?: number) => number', desc: `Execute a function repeatedly at intervals. ${ASYNC_CALLBACK_NOTE}`, kind: 'method' },
     { name: 'clearInterval', type: '(id: number) => void', desc: 'Cancel an interval', kind: 'method' },
-    { name: 'fetch', type: '(input: RequestInfo, init?: RequestInit) => Promise<Response>', desc: 'Fetch a resource from the network', kind: 'method' },
+    { name: 'fetch', type: '(input: RequestInfo, init?: RequestInit) => Promise<Response>', desc: `Fetch a resource from the network. ${ASYNC_CALLBACK_NOTE}`, kind: 'method' },
     { name: 'atob', type: '(data: string) => string', desc: 'Decode a base64-encoded string', kind: 'method' },
     { name: 'btoa', type: '(data: string) => string', desc: 'Encode a string to base64', kind: 'method' },
     { name: 'matchMedia', type: '(query: string) => MediaQueryList', desc: 'Check if a media query matches', kind: 'method' },
+];
+
+const LOCATION_MEMBERS: GlobalMember[] = [
+    { name: 'href', type: 'string', desc: 'The full URL — assigning it navigates the page', kind: 'property' },
+    { name: 'origin', type: 'string', desc: 'Scheme + host + port (read-only)', kind: 'property' },
+    { name: 'protocol', type: 'string', desc: 'URL scheme including the trailing `:` (e.g. `"https:"`)', kind: 'property' },
+    { name: 'host', type: 'string', desc: 'Hostname and port', kind: 'property' },
+    { name: 'hostname', type: 'string', desc: 'Hostname without the port', kind: 'property' },
+    { name: 'port', type: 'string', desc: 'Port number as a string (may be empty)', kind: 'property' },
+    { name: 'pathname', type: 'string', desc: 'Path portion of the URL, starting with `/`', kind: 'property' },
+    { name: 'search', type: 'string', desc: 'Query string including the leading `?` (or empty)', kind: 'property' },
+    { name: 'hash', type: 'string', desc: 'Fragment including the leading `#` (or empty)', kind: 'property' },
+    { name: 'assign', type: '(url: string) => void', desc: 'Navigate to the given URL (adds a history entry)', kind: 'method' },
+    { name: 'replace', type: '(url: string) => void', desc: 'Navigate to the given URL replacing the current history entry', kind: 'method' },
+    { name: 'reload', type: '() => void', desc: 'Reload the current page', kind: 'method' },
+];
+
+const NAVIGATOR_MEMBERS: GlobalMember[] = [
+    { name: 'userAgent', type: 'string', desc: 'The browser user-agent string', kind: 'property' },
+    { name: 'language', type: 'string', desc: 'The user\'s preferred language (e.g. `"en-US"`)', kind: 'property' },
+    { name: 'languages', type: 'readonly string[]', desc: 'The user\'s preferred languages, most preferred first', kind: 'property' },
+    { name: 'onLine', type: 'boolean', desc: 'Whether the browser reports being online', kind: 'property' },
+    { name: 'clipboard', type: 'Clipboard', desc: 'Async clipboard API (`readText()` / `writeText()`)', kind: 'property' },
+    { name: 'geolocation', type: 'Geolocation', desc: 'Geolocation API (`getCurrentPosition()` / `watchPosition()`)', kind: 'property' },
+    { name: 'maxTouchPoints', type: 'number', desc: 'Maximum number of simultaneous touch points supported', kind: 'property' },
+    { name: 'sendBeacon', type: '(url: string, data?: BodyInit | null) => boolean', desc: 'Queue a small async POST that survives page unload', kind: 'method' },
+];
+
+const STORAGE_MEMBERS: GlobalMember[] = [
+    { name: 'length', type: 'number', desc: 'Number of stored key/value pairs', kind: 'property' },
+    { name: 'getItem', type: '(key: string) => string | null', desc: 'Get the value for a key, or `null` if absent', kind: 'method' },
+    { name: 'setItem', type: '(key: string, value: string) => void', desc: 'Store a string value under a key', kind: 'method' },
+    { name: 'removeItem', type: '(key: string) => void', desc: 'Remove the entry for a key', kind: 'method' },
+    { name: 'clear', type: '() => void', desc: 'Remove all entries', kind: 'method' },
+    { name: 'key', type: '(index: number) => string | null', desc: 'Get the key name at the given index', kind: 'method' },
 ];
 
 /** All registered global objects */
@@ -208,9 +253,13 @@ const GLOBAL_OBJECTS: GlobalObject[] = [
     { name: 'Number', type: 'NumberConstructor', desc: 'Number static methods and constants', members: NUMBER_MEMBERS },
     { name: 'String', type: 'StringConstructor', desc: 'String static methods', members: STRING_MEMBERS },
     { name: 'Date', type: 'DateConstructor', desc: 'Date static methods', members: DATE_MEMBERS },
-    { name: 'Promise', type: 'PromiseConstructor', desc: 'Promise static methods', members: PROMISE_MEMBERS },
+    { name: 'Promise', type: 'PromiseConstructor', desc: `Promise static methods. ${ASYNC_CALLBACK_NOTE}`, members: PROMISE_MEMBERS },
     { name: 'document', type: 'Document', desc: 'The current HTML document', members: DOCUMENT_MEMBERS },
     { name: 'window', type: 'Window', desc: 'The global window object', members: WINDOW_MEMBERS },
+    { name: 'location', type: 'Location', desc: 'The current page URL. Framework note: in routed nuBond apps prefer the injected `Router` — direct location changes bypass router state', members: LOCATION_MEMBERS },
+    { name: 'navigator', type: 'Navigator', desc: 'Browser and platform information', members: NAVIGATOR_MEMBERS },
+    { name: 'localStorage', type: 'Storage', desc: 'Persistent per-origin key/value storage (strings only)', members: STORAGE_MEMBERS },
+    { name: 'sessionStorage', type: 'Storage', desc: 'Per-tab key/value storage cleared when the tab closes (strings only)', members: STORAGE_MEMBERS },
 ];
 
 /** Map for O(1) lookup by global object name */
@@ -250,16 +299,18 @@ const GLOBAL_FUNCTIONS: GlobalFunction[] = [
     { name: 'decodeURIComponent', type: '(component: string) => string', desc: 'Decode an encoded URI component' },
     { name: 'encodeURI', type: '(uri: string) => string', desc: 'Encode a URI' },
     { name: 'decodeURI', type: '(uri: string) => string', desc: 'Decode an encoded URI' },
-    { name: 'setTimeout', type: '(handler: Function, timeout?: number) => number', desc: 'Execute a function after a delay' },
+    { name: 'setTimeout', type: '(handler: Function, timeout?: number) => number', desc: `Execute a function after a delay. ${ASYNC_CALLBACK_NOTE}` },
     { name: 'clearTimeout', type: '(id: number) => void', desc: 'Cancel a timeout' },
-    { name: 'setInterval', type: '(handler: Function, timeout?: number) => number', desc: 'Execute a function repeatedly' },
+    { name: 'setInterval', type: '(handler: Function, timeout?: number) => number', desc: `Execute a function repeatedly. ${ASYNC_CALLBACK_NOTE}` },
     { name: 'clearInterval', type: '(id: number) => void', desc: 'Cancel an interval' },
-    { name: 'fetch', type: '(input: RequestInfo, init?: RequestInit) => Promise<Response>', desc: 'Fetch a resource from the network' },
+    { name: 'fetch', type: '(input: RequestInfo, init?: RequestInit) => Promise<Response>', desc: `Fetch a resource from the network. ${ASYNC_CALLBACK_NOTE}` },
     { name: 'alert', type: '(message?: any) => void', desc: 'Show an alert dialog' },
     { name: 'atob', type: '(data: string) => string', desc: 'Decode a base64-encoded string' },
     { name: 'btoa', type: '(data: string) => string', desc: 'Encode a string to base64' },
-    { name: 'requestAnimationFrame', type: '(callback: FrameRequestCallback) => number', desc: 'Request a callback before next repaint' },
+    { name: 'requestAnimationFrame', type: '(callback: FrameRequestCallback) => number', desc: `Request a callback before next repaint. ${ASYNC_CALLBACK_NOTE}` },
     { name: 'cancelAnimationFrame', type: '(handle: number) => void', desc: 'Cancel a requested animation frame' },
+    { name: 'structuredClone', type: '<T>(value: T, options?: StructuredSerializeOptions) => T', desc: 'Deep-clone a value (the same algorithm `nb-in` uses). Throws `DataCloneError` on functions, DOM nodes, and other non-cloneable values' },
+    { name: 'queueMicrotask', type: '(callback: () => void) => void', desc: `Queue a callback to run at the end of the current task. ${ASYNC_CALLBACK_NOTE}` },
 ];
 
 /** Global constants/values */

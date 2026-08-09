@@ -7,15 +7,15 @@
 import * as vscode from 'vscode';
 import { logError } from '../core/logger';
 import { getHandlerInfo, buildHandlerDocumentation, isNAttribute } from '../core/attribute-registry';
-import { findBindingAtOffset, isInRepeatScope, getAllRepeatScopes, getAllLocalVars, findElementAtOffset } from '../core/template-parser';
+import { findBindingAtOffset, isInRepeatScope, getAllRepeatScopes, getAllLocalVars, findElementAtOffset, isEvaluatedBinding } from '../core/template-parser';
 import { parseTemplateCached } from '../core/template-parser-cache';
 import type { TemplateAttribute, ParsedTemplate } from '../core/template-parser';
-import { parseExpression, findMemberAtOffset, MemberReference } from '../core/expression-parser';
+import { parseExpression, findMemberAtOffset, maskNonCode, MemberReference } from '../core/expression-parser';
 import { DecoratorAnalyzer } from '../core/decorator-analyzer';
 import type { TemplateAssociation } from '../core/decorator-analyzer';
 import { inferItemType, getEventType, getElementType, getChainIndexAtOffset, resolveChainType, getEventMemberInfo, getDomMemberInfo, getElementManipulationMemberInfo } from '../core/utils';
 import type { MemberInfo } from '../core/utils';
-import { getModelInjection, getModelInjectionMember } from '../core/model-injections-registry';
+import { getModelInjection, getModelInjectionByType, getModelInjectionMember } from '../core/model-injections-registry';
 
 export class nHoverProvider implements vscode.HoverProvider {
     constructor(private analyzer: DecoratorAnalyzer) {}
@@ -65,11 +65,18 @@ export class nHoverProvider implements vscode.HoverProvider {
             return new vscode.Hover(md, nameRange);
         }
 
+        // '@' constants and '%' route slots are literal text at runtime — a
+        // `this.member` or identifier inside them is prose, not a resolvable
+        // reference (same rule rename/references/definition already apply).
+        if (!isEvaluatedBinding(binding)) return undefined;
+
         // Hovering inside the attribute value → show member info if on this.X
         const associations = this.analyzer.getAssociationsForHtml(document.uri.fsPath);
 
         const offsetInValue = offset - binding.valueSpan.start;
-        const prefixLen = binding.expressionPrefix ? 1 : 0;
+        // Offset of the expression inside the raw value (prefix may sit after
+        // leading whitespace — the runtime trims before prefix detection).
+        const prefixLen = binding.expressionOffset;
         const exprOffset = offsetInValue - prefixLen;
 
         if (exprOffset < 0) return undefined;
@@ -97,6 +104,10 @@ export class nHoverProvider implements vscode.HoverProvider {
                     );
                     return new vscode.Hover(md, valueRange);
                 }
+                // Unresolvable chained member: no hover. Falling through
+                // rendered the ROOT member's info while the cursor sat on
+                // `bar` in `this.foo.bar` — wrong symbol, shown confidently.
+                return undefined;
             }
 
             // Root member hover — check class members first
@@ -118,8 +129,14 @@ export class nHoverProvider implements vscode.HoverProvider {
                 }
             }
 
-            // Check model injections (changeDetector, elementManipulations, etc.)
-            const injection = getModelInjection(memberRef.rootMember);
+            // Check model injections by conventional name — ONLY when no
+            // analysis data exists for this template. DI is constructor-param
+            // based (the instance property is whatever the user named the
+            // param), so when associations exist a missing member means the
+            // reference is dead and diagnostics flags it; blessing it here
+            // contradicted the diagnostics provider. Members whose declared
+            // TYPE is an injection are handled in resolveChainedMember.
+            const injection = associations.length === 0 ? getModelInjection(memberRef.rootMember) : undefined;
             if (injection) {
                 if (chainIndex > 0) {
                     // Deep chain: e.g. this.changeDetector.detect — resolve from chain[1]+
@@ -157,7 +174,14 @@ export class nHoverProvider implements vscode.HoverProvider {
         }
 
         // Check for injected parameter hover (item, index, count, element, event, etc.)
-        const wordAtOffset = getWordAtOffset(binding.expression, exprOffset);
+        // Scanned on a MASKED copy (string/template-literal text, comments,
+        // regex literals blanked — offsets preserved): an 'item' inside
+        // `this.t('item')` is prose, and hovering it as a repeat parameter
+        // documented an identifier the runtime never resolves there
+        // (round-7 audit, R7-2). parseExpression masks internally, but these
+        // fallback word/dotted-access scans previously ran on the raw text.
+        const maskedExpression = maskNonCode(binding.expression);
+        const wordAtOffset = getWordAtOffset(maskedExpression, exprOffset);
         if (wordAtOffset) {
             const element = findElementAtOffset(parsed, binding.nameSpan.start);
             const tagName = element?.tagName;
@@ -204,7 +228,9 @@ export class nHoverProvider implements vscode.HoverProvider {
         }
 
         // Check for dotted access on injected parameters (event.X, nativeElement.X, element.X)
-        const dottedAccess = findDottedAccessAtOffset(binding.expression, exprOffset);
+        // Same masking rule as above — `event.detail` inside a string literal
+        // is prose, not a member access.
+        const dottedAccess = findDottedAccessAtOffset(maskedExpression, exprOffset);
         if (dottedAccess) {
             const element = findElementAtOffset(parsed, binding.nameSpan.start);
             const tagName = element?.tagName;
@@ -245,25 +271,27 @@ export class nHoverProvider implements vscode.HoverProvider {
             }
         }
 
-        // Fallback: check model injections
-        if (!currentType) {
-            const injection = getModelInjection(memberRef.rootMember);
-            if (injection) {
-                // Walk the chain through model injection members from chain[1]
-                let members = injection.members;
-                for (let i = 1; i <= chainIndex; i++) {
-                    const found = members.find(m => m.name === memberRef.chain[i]);
-                    if (!found) return undefined;
-                    if (i === chainIndex) {
-                        return { name: found.name, type: found.type, kind: found.kind, ownerType: injection.type };
-                    }
-                    members = found.subMembers ?? [];
+        // No name-based injection fallback here: with associations present, a
+        // missing root member is a dead reference (diagnostics flags it).
+        if (!currentType) return undefined;
+
+        // Root member's declared type is a framework injection
+        // (`constructor(private cd: ChangeDetector)` → `this.cd.detect`):
+        // walk the injection's member tree instead of the type index, which
+        // can't see framework types living in node_modules.
+        const injectionForType = getModelInjectionByType(currentType);
+        if (injectionForType) {
+            let members = injectionForType.members;
+            for (let i = 1; i <= chainIndex; i++) {
+                const found = members.find(m => m.name === memberRef.chain[i]);
+                if (!found) return undefined;
+                if (i === chainIndex) {
+                    return { name: found.name, type: found.type, kind: found.kind, ownerType: injectionForType.type };
                 }
+                members = found.subMembers ?? [];
             }
             return undefined;
         }
-
-        if (!currentType) return undefined;
 
         // Walk intermediate chain members to resolve their types
         for (let i = 1; i < chainIndex; i++) {
@@ -355,6 +383,9 @@ function resolveInjectedParam(
             'nativeElement': nativeType,
             'data': 'any',
             'unSubscribe': '() => void',
+            // Only injected when routing is configured — without a configured
+            // router the parameter does not exist at all (referencing it is a
+            // ReferenceError, not `undefined`), so the type is plain Router.
             'router': 'Router',
         };
         if (word in eventParams) {
@@ -374,8 +405,11 @@ function resolveInjectedParam(
         }
     }
 
-    // Check nb-repeat injected params (available in descendant bindings)
-    const repeatScopes = getAllRepeatScopes(parsed, offset);
+    // Check nb-repeat injected params (available in descendant bindings and
+    // sibling bindings — but NOT in the nb-repeat's own collection
+    // expression, which runs with the parent params).
+    const ownRepeat = binding.baseName === 'nb-repeat' ? binding : undefined;
+    const repeatScopes = getAllRepeatScopes(parsed, offset, ownRepeat);
     for (const scope of repeatScopes) {
         const p = scope.prefix;
         const itemName = p ? `${p}Item` : 'item';
@@ -405,8 +439,11 @@ function resolveInjectedParam(
         }
     }
 
-    // Check nb-var local variables (available in descendant bindings)
-    const localVars = getAllLocalVars(parsed, offset);
+    // Check nb-var local variables. The consumer-aware overload applies the
+    // runtime gating rules: an nb-repeat's own expression and nb-case /
+    // nb-default expressions never see the element's own vars, and the first
+    // nb-var on an element sees no sibling vars.
+    const localVars = getAllLocalVars(parsed, offset, binding);
     for (const lv of localVars) {
         if (word === lv.varName) {
             let varType = 'any';
@@ -422,18 +459,11 @@ function resolveInjectedParam(
         }
     }
 
-    // Check if 'element' or 'nativeElement' is used in any binding on an element with nb-bound
-    if (word === 'element' || word === 'nativeElement') {
-        const element = findElementAtOffset(parsed, offset);
-        if (element) {
-            const hasBound = element.nbAttributes.some(a => a.baseName === 'nb-bound');
-            if (hasBound) {
-                const nativeType = tagName ? getElementType(tagName) : 'Element';
-                const type = word === 'element' ? 'ElementManipulations' : nativeType;
-                return { name: word, type, source: 'nb-bound' };
-            }
-        }
-    }
+    // NOTE: `element` / `nativeElement` are deliberately NOT blessed here for
+    // other bindings on an element that merely carries nb-bound — the runtime
+    // injects them only into the nb-event / nb-bound expression itself
+    // (handled above), and referencing them from a sibling nb-value is a
+    // ReferenceError.
 
     return undefined;
 }
@@ -479,7 +509,7 @@ function findDottedAccessAtOffset(expression: string, offset: number): DottedAcc
     const token1 = expression.substring(t1Start, dotPos);
     if (!token1) return undefined;
 
-    const knownBases = ['event', 'nativeElement', 'element'];
+    const knownBases = ['event', 'nativeElement', 'element', 'router'];
 
     // Check for base.member (2-level)
     if (knownBases.includes(token1)) {
@@ -502,7 +532,11 @@ function findDottedAccessAtOffset(expression: string, offset: number): DottedAcc
 }
 
 /**
- * Resolve hover info for a dotted access on an injected parameter.
+ * Resolve hover info for a dotted access on an injected parameter. Every
+ * branch is gated on the binding that actually injects the base identifier —
+ * `element` / `nativeElement` exist only inside nb-event / nb-bound
+ * expressions (like `event` exists only inside nb-event); blessing them in
+ * an nb-value hover documented an identifier that is a ReferenceError there.
  */
 function resolveInjectedMemberHover(
     access: DottedAccess,
@@ -517,8 +551,25 @@ function resolveInjectedMemberHover(
         if (info) return { info, ownerType: eventType };
     }
 
+    // router.X — the bare `router` param injected into nb-event expressions;
+    // members come from the Router model-injection registry.
+    if (access.base === 'router' && !access.sub) {
+        if (binding.baseName !== 'nb-event') return undefined;
+        const injection = getModelInjection('router');
+        const member = injection?.members.find(m => m.name === access.member);
+        if (member) {
+            return {
+                info: { type: member.type, desc: member.desc, kind: member.kind },
+                ownerType: injection!.type,
+            };
+        }
+    }
+
+    const injectsElementParams = binding.baseName === 'nb-event' || binding.baseName === 'nb-bound';
+
     // nativeElement.X — look up in DOM element member registry
     if (access.base === 'nativeElement' && !access.sub) {
+        if (!injectsElementParams) return undefined;
         const elementType = tagName ? getElementType(tagName) : 'HTMLElement';
         const info = getDomMemberInfo(access.member, elementType);
         if (info) return { info, ownerType: elementType };
@@ -526,12 +577,14 @@ function resolveInjectedMemberHover(
 
     // element.X — top-level ElementManipulations member
     if (access.base === 'element' && !access.sub) {
+        if (!injectsElementParams) return undefined;
         const info = getElementManipulationMemberInfo(undefined, access.member);
         if (info) return { info, ownerType: 'ElementManipulations' };
     }
 
     // element.sub.X — sub-manipulation member (e.g. element.styles.get)
     if (access.base === 'element' && access.sub) {
+        if (!injectsElementParams) return undefined;
         const info = getElementManipulationMemberInfo(access.sub, access.member);
         if (info) {
             const subTypes: Record<string, string> = {

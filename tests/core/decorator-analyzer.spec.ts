@@ -1,6 +1,6 @@
 import { DecoratorAnalyzer } from '../../src/core/decorator-analyzer';
 import { Constants } from '../../src/constants';
-import type * as ts from 'typescript';
+import * as ts from 'typescript';
 
 describe('DecoratorAnalyzer', () => {
     let analyzer: DecoratorAnalyzer;
@@ -676,11 +676,12 @@ describe('DecoratorAnalyzer', () => {
             const { ls, bumpVersion } = buildInMemoryLs(files);
 
             const first = analyzer.analyzeWithLanguageService(ls);
-            expect(first.length).toBe(2); // both files analyzed on cold start
+            expect(first!.length).toBe(2); // both files analyzed on cold start
 
             // No version bumps → second call should be a complete no-op
+            // (still a defined [] — undefined is reserved for failed passes)
             const second = analyzer.analyzeWithLanguageService(ls);
-            expect(second.length).toBe(0);
+            expect(second).toEqual([]);
 
             // Now simulate editing file a — only a should be re-analyzed
             files.set('/test/a.ts', `
@@ -690,8 +691,8 @@ describe('DecoratorAnalyzer', () => {
             bumpVersion('/test/a.ts');
 
             const third = analyzer.analyzeWithLanguageService(ls);
-            expect(third.length).toBe(1);
-            expect(third[0]).toMatch(/a\.ts$/);
+            expect(third!.length).toBe(1);
+            expect(third![0]).toMatch(/a\.ts$/);
 
             // The new field is now indexed
             const aAssocs = analyzer.getAssociationsForTs('/test/a.ts');
@@ -716,9 +717,9 @@ describe('DecoratorAnalyzer', () => {
             expect(analyzer.getAssociationsForTs('/test/willGoAway.ts').length).toBe(0);
         });
 
-        it('returns empty array if the LanguageService has no Program yet', () => {
+        it('returns undefined (failed pass, not a no-op) if the LanguageService has no Program yet', () => {
             const fakeLs: any = { getProgram: () => undefined };
-            expect(analyzer.analyzeWithLanguageService(fakeLs)).toEqual([]);
+            expect(analyzer.analyzeWithLanguageService(fakeLs)).toBeUndefined();
         });
 
         // ---- Failure-isolation regressions ----
@@ -731,7 +732,8 @@ describe('DecoratorAnalyzer', () => {
         it('does not throw when LanguageService.getProgram() throws', () => {
             const exploding: any = { getProgram: () => { throw new Error('tsserver bad state'); } };
             expect(() => analyzer.analyzeWithLanguageService(exploding)).not.toThrow();
-            expect(analyzer.analyzeWithLanguageService(exploding)).toEqual([]);
+            // undefined signals "analysis never ran" so version stamps aren't advanced
+            expect(analyzer.analyzeWithLanguageService(exploding)).toBeUndefined();
         });
 
         it('does not throw when getTypeChecker() throws', () => {
@@ -742,7 +744,7 @@ describe('DecoratorAnalyzer', () => {
                 }),
             };
             expect(() => analyzer.analyzeWithLanguageService(exploding)).not.toThrow();
-            expect(analyzer.analyzeWithLanguageService(exploding)).toEqual([]);
+            expect(analyzer.analyzeWithLanguageService(exploding)).toBeUndefined();
         });
 
         it('does not throw when getSourceFiles() throws', () => {
@@ -753,7 +755,7 @@ describe('DecoratorAnalyzer', () => {
                 }),
             };
             expect(() => analyzer.analyzeWithLanguageService(exploding)).not.toThrow();
-            expect(analyzer.analyzeWithLanguageService(exploding)).toEqual([]);
+            expect(analyzer.analyzeWithLanguageService(exploding)).toBeUndefined();
         });
 
         // ---- Logger wiring (catastrophic failures must be observable) ----
@@ -971,6 +973,355 @@ describe('DecoratorAnalyzer', () => {
         });
     });
 
+    // ---- Regression: per-LanguageService stale-file cleanup (multi-tsconfig) ----
+    // Before fix: analyzeWithLanguageService removed every previously analyzed
+    // file missing from the CURRENT program — with one LS per tsconfig group,
+    // each group's analysis wiped all other groups. Multi-project workspaces
+    // ended up with only the most recently analyzed project alive.
+    describe('multi-LanguageService isolation', () => {
+        const ts = require('typescript');
+
+        function buildLsWithVersions(fileMap: Record<string, string>) {
+            const files = new Map(Object.entries(fileMap));
+            const versions = new Map<string, number>();
+            for (const f of files.keys()) versions.set(f, 0);
+            const host: any = {
+                getScriptFileNames: () => Array.from(files.keys()),
+                getScriptVersion: (f: string) => String(versions.get(f) ?? 0),
+                getScriptSnapshot: (f: string) => {
+                    const text = files.get(f);
+                    return text !== undefined ? ts.ScriptSnapshot.fromString(text) : undefined;
+                },
+                getCompilationSettings: () => ({
+                    target: ts.ScriptTarget.ES2020,
+                    module: ts.ModuleKind.CommonJS,
+                    experimentalDecorators: true,
+                    skipLibCheck: true,
+                    noEmit: true,
+                }),
+                getDefaultLibFileName: (opts: any) => ts.getDefaultLibFilePath(opts),
+                fileExists: (f: string) => files.has(f) || ts.sys.fileExists(f),
+                readFile: (f: string) => files.get(f) ?? ts.sys.readFile(f),
+                getCurrentDirectory: () => '/test',
+                useCaseSensitiveFileNames: () => true,
+                getNewLine: () => '\n',
+            };
+            return {
+                ls: ts.createLanguageService(host, ts.createDocumentRegistry()),
+                files,
+                bumpVersion: (f: string) => versions.set(f, (versions.get(f) ?? 0) + 1),
+            };
+        }
+
+        function buildLs(fileMap: Record<string, string>) {
+            return buildLsWithVersions(fileMap).ls;
+        }
+
+        it('analyzing one tsconfig group does not wipe another group\'s results', () => {
+            const lsA = buildLs({ '/proj-a/one.ts': `@Container('<div></div>') class One { x: string = ''; }` });
+            const lsB = buildLs({ '/proj-b/two.ts': `@Container('<div></div>') class Two { y: string = ''; }` });
+
+            analyzer.analyzeWithLanguageService(lsA);
+            analyzer.analyzeWithLanguageService(lsB);
+
+            // Both groups' associations must coexist
+            expect(analyzer.getAssociationsForTs('/proj-a/one.ts').length).toBe(1);
+            expect(analyzer.getAssociationsForTs('/proj-b/two.ts').length).toBe(1);
+
+            // Re-analyzing group A must not evict group B either
+            analyzer.analyzeWithLanguageService(lsA);
+            expect(analyzer.getAssociationsForTs('/proj-b/two.ts').length).toBe(1);
+        });
+
+        it('does not evict a file still present in another service\'s program', () => {
+            // Programs contain transitive imports, so a file rooted in group A
+            // can ALSO appear in group B's program. When B stops importing it,
+            // B's stale-file cleanup must not wipe A's analysis of it.
+            const lsA = buildLs({
+                '/shared/util.ts': `@Container('<div></div>') export class SharedUtil { v: string = ''; }`,
+            });
+            const b = buildLsWithVersions({
+                '/proj-b/feature.ts': `
+                    import { SharedUtil } from '../shared/util';
+                    @Container('<div></div>')
+                    class Feature { dep: SharedUtil | null = null; }
+                `,
+                '/shared/util.ts': `@Container('<div></div>') export class SharedUtil { v: string = ''; }`,
+            });
+
+            analyzer.analyzeWithLanguageService(lsA);
+            analyzer.analyzeWithLanguageService(b.ls);
+            expect(analyzer.getAssociationsForTs('/shared/util.ts').length).toBe(1);
+
+            // Group B drops the shared file entirely
+            b.files.delete('/shared/util.ts');
+            b.files.set('/proj-b/feature.ts', `
+                @Container('<div></div>')
+                class Feature { dep: null = null; }
+            `);
+            b.bumpVersion('/proj-b/feature.ts');
+            analyzer.analyzeWithLanguageService(b.ls);
+
+            // Group A still claims the shared file — analysis must survive
+            expect(analyzer.getAssociationsForTs('/shared/util.ts').length).toBe(1);
+        });
+    });
+
+    // ---- Regression: member positions anchored on the identifier ----
+    // Before fix: positions came from member.getStart(), which points at
+    // modifiers/decorators ('public', '@Detector()'). Rename then replaced
+    // the start of the modifier, corrupting the declaration.
+    describe('member position anchoring', () => {
+        it('positions members with modifiers at the identifier, not the modifier', () => {
+            const source = `@Container('<i></i>')
+class TestContainer {
+    public title: string = '';
+    private secret: number = 0;
+}`;
+            analyzer.analyzeSourceText('/test/anchored.ts', source);
+            const assoc = analyzer.getAssociationsForTs('/test/anchored.ts')[0];
+            const lines = source.split('\n');
+
+            const title = assoc.members.find(m => m.name === 'title')!;
+            expect(lines[title.line].substring(title.character, title.character + 'title'.length)).toBe('title');
+
+            const secret = assoc.members.find(m => m.name === 'secret')!;
+            expect(lines[secret.line].substring(secret.character, secret.character + 'secret'.length)).toBe('secret');
+        });
+
+        it('positions decorated members at the identifier', () => {
+            const source = `@Container('<i></i>')
+class TestContainer {
+    @Detector() counter = 0;
+}`;
+            analyzer.analyzeSourceText('/test/decorated.ts', source);
+            const assoc = analyzer.getAssociationsForTs('/test/decorated.ts')[0];
+            const lines = source.split('\n');
+            const counter = assoc.members.find(m => m.name === 'counter')!;
+            expect(lines[counter.line].substring(counter.character, counter.character + 'counter'.length)).toBe('counter');
+        });
+
+        it('positions constructor parameters at the identifier, not the visibility modifier', () => {
+            const source = `@Container('<i></i>')
+class TestContainer {
+    constructor(public service: object) {}
+}`;
+            analyzer.analyzeSourceText('/test/ctor-anchored.ts', source);
+            const assoc = analyzer.getAssociationsForTs('/test/ctor-anchored.ts')[0];
+            const lines = source.split('\n');
+            const service = assoc.members.find(m => m.name === 'service')!;
+            expect(lines[service.line].substring(service.character, service.character + 'service'.length)).toBe('service');
+        });
+    });
+
+    // ---- Regression: runtime-registered entity names ----
+    describe('registered entity names', () => {
+        it('registers container custom names from the [name, template] array form', () => {
+            const source = `
+                import html from './card.html';
+                @Container(['my-card', html])
+                class CardController { x: string = ''; }
+            `;
+            analyzer.analyzeSourceText('/test/card.ts', source);
+            const containers = analyzer.getEntitiesByType('container');
+            expect(containers.length).toBe(1);
+            expect(containers[0].name).toBe('my-card');
+            expect(containers[0].className).toBe('CardController');
+        });
+
+        it('registers components under their kebab-case runtime name', () => {
+            const source = `
+                @Component('<div></div>')
+                class UserCard { x: string = ''; }
+            `;
+            analyzer.analyzeSourceText('/test/user-card.ts', source);
+            const components = analyzer.getEntitiesByType('component');
+            expect(components[0].name).toBe('user-card');
+        });
+
+        it('registers aspects under their kebab-case runtime name', () => {
+            const source = `
+                @Aspect()
+                class VisibilityAspect { }
+            `;
+            analyzer.analyzeSourceText('/test/aspect-name.ts', source);
+            const aspects = analyzer.getEntitiesByType('aspect');
+            expect(aspects[0].name).toBe('visibility-aspect');
+        });
+
+        it('camelCases explicit transformer names like the runtime does', () => {
+            const source = `
+                @Transformer('Fmt')
+                class Formatter { transform(v: string): string { return v; } }
+            `;
+            analyzer.analyzeSourceText('/test/fmt.ts', source);
+            const transformers = analyzer.getEntitiesByType('transformer');
+            expect(transformers[0].transformerFunctionName).toBe('fmt');
+            expect(analyzer.getTransformerByFunctionName('fmt')).toBeDefined();
+        });
+    });
+
+    // ---- Regression: @AppRoot string args are selectors/routes, not templates ----
+    describe('AppRoot argument handling', () => {
+        it('does not treat a selector string as an inline template', () => {
+            const source = `
+                @AppRoot('#app')
+                class App { x: string = ''; }
+            `;
+            analyzer.analyzeSourceText('/test/app-root.ts', source);
+            const assoc = analyzer.getAssociationsForTs('/test/app-root.ts')[0];
+            expect(assoc).toBeDefined();
+            // '#app' must NOT be recorded as an inline template — that
+            // suppressed the index.html fallback association.
+            expect(assoc.inlineTemplate).toBeUndefined();
+        });
+    });
+
+    // ---- Regression: $Template(...) global template registration ----
+    describe('$Template registration', () => {
+        it('registers template entities from $Template calls', () => {
+            const source = `
+                @Container('<div></div>', [$Template('info-icon', '<svg></svg>')])
+                class Main { }
+            `;
+            analyzer.analyzeSourceText('/test/templates.ts', source);
+            const templates = analyzer.getEntitiesByType('template');
+            expect(templates.length).toBe(1);
+            expect(templates[0].name).toBe('info-icon');
+            expect(templates[0].line).toBeGreaterThanOrEqual(0);
+        });
+
+        it('removes template entities when their file is removed', () => {
+            analyzer.analyzeSourceText('/test/tpl-rm.ts', `const n = $Template('gone', '<i></i>');`);
+            expect(analyzer.getEntitiesByType('template').length).toBe(1);
+            analyzer.removeFile('/test/tpl-rm.ts');
+            expect(analyzer.getEntitiesByType('template').length).toBe(0);
+        });
+    });
+
+    // ---- Regression: string template *paths* (BUG: treated as inline markup) ----
+    describe('string template path resolution', () => {
+        const fsMod = require('fs');
+        const pathMod = require('path');
+        const os = require('os');
+
+        it('resolves an existing .html path literal to a file association', () => {
+            const tmp = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), 'nubond-tpl-path-'));
+            try {
+                const htmlPath = pathMod.join(tmp, 'card.html');
+                fsMod.writeFileSync(htmlPath, '<div nb-value="this.x"></div>', 'utf-8');
+                const tsPath = pathMod.join(tmp, 'card.ts');
+
+                analyzer.analyzeSourceText(tsPath, `
+                    @Container('./card.html')
+                    class Card { x: string = ''; }
+                `);
+                const assoc = analyzer.getAssociationsForTs(tsPath)[0];
+                expect(assoc.inlineTemplate).toBeUndefined();
+                expect(assoc.htmlFilePath).toBeDefined();
+                expect(assoc.htmlFilePath!.replace(/\\/g, '/')).toContain('card.html');
+            } finally {
+                try { fsMod.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
+            }
+        });
+
+        it('keeps treating markup strings as inline templates', () => {
+            analyzer.analyzeSourceText('/test/inline-still.ts', `
+                @Container('<div>hello</div>')
+                class Inline { }
+            `);
+            const assoc = analyzer.getAssociationsForTs('/test/inline-still.ts')[0];
+            expect(assoc.inlineTemplate).toBe('<div>hello</div>');
+            expect(assoc.htmlFilePath).toBeUndefined();
+        });
+    });
+
+    // ---- Regression: inherited members (base-class properties were invisible) ----
+    describe('inherited members', () => {
+        const ts = require('typescript');
+
+        it('collects base-class members with declaredIn via the TypeChecker path', () => {
+            const files = new Map<string, string>();
+            files.set('/test/base.ts', `
+                export class BaseList {
+                    items: string[] = [];
+                    protected refresh(): void {}
+                    private internal = 1;
+                }
+            `);
+            files.set('/test/sub.ts', `
+                import { BaseList } from './base';
+                @Container('<div></div>')
+                class Sub extends BaseList {
+                    own: number = 0;
+                }
+            `);
+
+            const host: any = {
+                getScriptFileNames: () => Array.from(files.keys()),
+                getScriptVersion: () => '0',
+                getScriptSnapshot: (f: string) => {
+                    const text = files.get(f);
+                    return text !== undefined ? ts.ScriptSnapshot.fromString(text) : undefined;
+                },
+                getCompilationSettings: () => ({
+                    target: ts.ScriptTarget.ES2020,
+                    module: ts.ModuleKind.CommonJS,
+                    experimentalDecorators: true,
+                    skipLibCheck: true,
+                    noEmit: true,
+                }),
+                getDefaultLibFileName: (opts: any) => ts.getDefaultLibFilePath(opts),
+                fileExists: (f: string) => files.has(f) || ts.sys.fileExists(f),
+                readFile: (f: string) => files.get(f) ?? ts.sys.readFile(f),
+                getCurrentDirectory: () => '/test',
+                useCaseSensitiveFileNames: () => true,
+                getNewLine: () => '\n',
+            };
+            const ls = ts.createLanguageService(host, ts.createDocumentRegistry());
+
+            analyzer.analyzeWithLanguageService(ls);
+            const assoc = analyzer.getAssociationsForTs('/test/sub.ts')[0];
+            expect(assoc).toBeDefined();
+
+            // Own member: no declaredIn
+            const own = assoc.members.find(m => m.name === 'own');
+            expect(own).toBeDefined();
+            expect(own!.declaredIn).toBeUndefined();
+
+            // Inherited member: present, carries the declaring file
+            const items = assoc.members.find(m => m.name === 'items');
+            expect(items).toBeDefined();
+            expect(items!.declaredIn).toContain('base.ts');
+            expect(items!.isPublic).toBe(true);
+
+            // Inherited private member: present but not public
+            const internal = assoc.members.find(m => m.name === 'internal');
+            expect(internal).toBeDefined();
+            expect(internal!.isPublic).toBe(false);
+        });
+    });
+
+    // ---- Regression: typeIndex must tolerate same-named types in many files ----
+    describe('typeIndex multimap', () => {
+        it('resolves a type even when another file declares the same name', () => {
+            analyzer.analyzeSourceText('/test/dup-a.ts', 'export interface Dup { a: number; }');
+            analyzer.analyzeSourceText('/test/dup-b.ts', 'export interface Dup { b: string; }');
+
+            // Member lookup scans candidates until the declaring file is found
+            expect(analyzer.findMemberWithType('Dup', 'a')).toBeDefined();
+            expect(analyzer.findMemberWithType('Dup', 'b')).toBeDefined();
+
+            // Removing one file keeps the other's declaration resolvable —
+            // last-write-wins previously deleted the whole index entry.
+            analyzer.removeFile('/test/dup-b.ts');
+            const members = analyzer.getTypeMembers('Dup');
+            expect(members).toBeDefined();
+            expect(members!.some(m => m.name === 'a')).toBe(true);
+            expect(analyzer.findMemberWithType('Dup', 'b')).toBeUndefined();
+        });
+    });
+
     // ---- Regression: Fix #4 — typeIndex case-insensitive path cleanup ----
     // Before fix: removeFile cleaned typeIndex with normalizeSlashes (case-sensitive).
     // On Windows, TypeScript's createProgram resolves file paths with a different case
@@ -1010,5 +1361,533 @@ describe('DecoratorAnalyzer', () => {
                 readSpy.mockRestore();
             }
         });
+    });
+});
+
+// ---- Round-2 regressions ----
+
+describe('DecoratorAnalyzer — round-2 regressions', () => {
+    let analyzer: import('../../src/core/decorator-analyzer').DecoratorAnalyzer;
+
+    beforeEach(() => {
+        const { DecoratorAnalyzer } = require('../../src/core/decorator-analyzer');
+        analyzer = new DecoratorAnalyzer();
+    });
+
+    describe('constructor parameter properties (all modifiers)', () => {
+        const source = `
+            @Container({ template: './test.html' })
+            class DiContainer {
+                constructor(private cd: ChangeDetector,
+                            protected svc: DataService,
+                            readonly config: AppConfig,
+                            plainParam: string) {}
+            }
+        `;
+
+        it('collects private constructor params as (non-public) members', () => {
+            analyzer.analyzeSourceText('/test/di.ts', source);
+            const members = analyzer.getAssociationsForTs('/test/di.ts')[0].members;
+            const cd = members.find(m => m.name === 'cd');
+            expect(cd).toBeDefined();
+            expect(cd!.isPublic).toBe(false);
+            expect(cd!.type).toBe('ChangeDetector');
+        });
+
+        it('collects protected and readonly params as public members', () => {
+            analyzer.analyzeSourceText('/test/di.ts', source);
+            const members = analyzer.getAssociationsForTs('/test/di.ts')[0].members;
+            expect(members.find(m => m.name === 'svc')?.isPublic).toBe(true);
+            expect(members.find(m => m.name === 'config')?.isPublic).toBe(true);
+        });
+
+        it('still ignores plain (non-property) constructor params', () => {
+            analyzer.analyzeSourceText('/test/di.ts', source);
+            const members = analyzer.getAssociationsForTs('/test/di.ts')[0].members;
+            expect(members.find(m => m.name === 'plainParam')).toBeUndefined();
+        });
+    });
+
+    describe('array-literal template form with backtick templates', () => {
+        it('captures a NoSubstitutionTemplateLiteral inline template', () => {
+            const source = [
+                "@Component(['my-card', `<div nb-value=\"this.title\"></div>`])",
+                'class MyCard { title = ""; }',
+            ].join('\n');
+            analyzer.analyzeSourceText('/test/my-card.ts', source);
+            const assoc = analyzer.getAssociationsForTs('/test/my-card.ts')[0];
+            expect(assoc).toBeDefined();
+            expect(assoc.inlineTemplate).toContain('nb-value');
+        });
+    });
+
+    // ---- Regression: static members are NOT instance members ----
+    // Template expressions run with `.apply(instance)`, so `this.X` can never
+    // reach a static. Listing them offered dead completions after `this.` and
+    // let diagnostics silently accept `this.someStatic`.
+    describe('static member exclusion', () => {
+        it('excludes static properties and methods from the member list', () => {
+            const source = `
+                @Container('./x.html')
+                class WithStatics {
+                    static DEFAULT_NAME = 'x';
+                    static compute(): number { return 1; }
+                    static get version(): string { return '1'; }
+                    name: string = '';
+                    getName(): string { return this.name; }
+                }
+            `;
+            analyzer.analyzeSourceText('/test/statics.ts', source);
+            const members = analyzer.getAssociationsForTs('/test/statics.ts')[0].members;
+            expect(members.find(m => m.name === 'DEFAULT_NAME')).toBeUndefined();
+            expect(members.find(m => m.name === 'compute')).toBeUndefined();
+            expect(members.find(m => m.name === 'version')).toBeUndefined();
+            expect(members.find(m => m.name === 'name')).toBeDefined();
+            expect(members.find(m => m.name === 'getName')).toBeDefined();
+        });
+    });
+});
+
+// ---- Regressions on the LanguageService-backed analysis path ----
+// Own in-memory-LS helper (mirrors the one inside the main describe, which is
+// scoped there) so these suites stay self-contained.
+describe('DecoratorAnalyzer — multi-service and shared-declaration regressions', () => {
+    const ts = require('typescript');
+    let analyzer: DecoratorAnalyzer;
+
+    beforeEach(() => {
+        analyzer = new DecoratorAnalyzer();
+    });
+
+    function buildInMemoryLsHarness(files: Map<string, string>) {
+        const versions = new Map<string, number>();
+        for (const f of files.keys()) versions.set(f, 0);
+
+        const host: any = {
+            getScriptFileNames: () => Array.from(files.keys()),
+            getScriptVersion: (f: string) => String(versions.get(f) ?? 0),
+            getScriptSnapshot: (f: string) => {
+                const text = files.get(f);
+                return text !== undefined ? ts.ScriptSnapshot.fromString(text) : undefined;
+            },
+            getCompilationSettings: () => ({
+                target: ts.ScriptTarget.ES2020,
+                module: ts.ModuleKind.CommonJS,
+                experimentalDecorators: true,
+                strict: false,
+                skipLibCheck: true,
+                noEmit: true,
+            }),
+            getDefaultLibFileName: (opts: any) => ts.getDefaultLibFilePath(opts),
+            fileExists: (f: string) => files.has(f) || ts.sys.fileExists(f),
+            readFile: (f: string) => files.get(f) ?? ts.sys.readFile(f),
+            getCurrentDirectory: () => '/test',
+            useCaseSensitiveFileNames: () => true,
+            getNewLine: () => '\n',
+        };
+
+        return {
+            ls: ts.createLanguageService(host, ts.createDocumentRegistry()),
+            /** Simulate an edit: replace content and bump the script version. */
+            edit: (f: string, text: string) => {
+                files.set(f, text);
+                versions.set(f, (versions.get(f) ?? 0) + 1);
+            },
+        };
+    }
+
+    function buildInMemoryLs(files: Map<string, string>) {
+        return buildInMemoryLsHarness(files).ls;
+    }
+
+    // Regression: `lastAnalyzedSourceFiles` was keyed per file path but stored
+    // whichever service analyzed last. Two services sharing a file (via
+    // transitive imports) then failed the SourceFile identity check on every
+    // alternating pass — the shared file was removed + re-analyzed forever.
+    it('does not re-analyze files shared between two LanguageServices (no ping-pong)', () => {
+        const shared = `export interface SharedUser { id: number; }`;
+        const filesA = new Map<string, string>([
+            ['/test/shared.ts', shared],
+            ['/test/a.ts', `
+                import { SharedUser } from './shared';
+                @Container('./a.html')
+                class A { user: SharedUser | undefined; }
+            `],
+        ]);
+        const filesB = new Map<string, string>([
+            ['/test/shared.ts', shared],
+            ['/test/b.ts', `
+                import { SharedUser } from './shared';
+                @Container('./b.html')
+                class B { user: SharedUser | undefined; }
+            `],
+        ]);
+
+        const lsA = buildInMemoryLs(filesA);
+        const lsB = buildInMemoryLs(filesB);
+
+        // Cold starts: each service analyzes its own program once.
+        expect(analyzer.analyzeWithLanguageService(lsA)!.length).toBeGreaterThan(0);
+        expect(analyzer.analyzeWithLanguageService(lsB)!.length).toBeGreaterThan(0);
+
+        // Steady state: NOTHING changed — neither service may re-analyze
+        // anything, including the shared file. (Pre-fix, each call here
+        // re-analyzed /test/shared.ts because the other service's SourceFile
+        // reference was stored in the global map.)
+        expect(analyzer.analyzeWithLanguageService(lsA)).toEqual([]);
+        expect(analyzer.analyzeWithLanguageService(lsB)).toEqual([]);
+        expect(analyzer.analyzeWithLanguageService(lsA)).toEqual([]);
+    });
+
+    // Regression: rename/references only fanned out over the originating
+    // class's templates — sibling subclasses' templates went stale. The
+    // declaration-based lookup finds every association sharing a member.
+    it('getAssociationsWithMember returns every association sharing a declaration', () => {
+        const files = new Map<string, string>([
+            ['/test/base.ts', `export class BaseCard { title: string = ''; }`],
+            ['/test/a.ts', `
+                import { BaseCard } from './base';
+                @Container('./a.html')
+                class CardA extends BaseCard { onlyA: number = 0; }
+            `],
+            ['/test/b.ts', `
+                import { BaseCard } from './base';
+                @Container('./b.html')
+                class CardB extends BaseCard {}
+            `],
+        ]);
+
+        const ls = buildInMemoryLs(files);
+        analyzer.analyzeWithLanguageService(ls);
+
+        const aAssoc = analyzer.getAssociationsForTs('/test/a.ts')[0];
+        expect(aAssoc).toBeDefined();
+        const title = aAssoc.members.find(m => m.name === 'title');
+        expect(title).toBeDefined();
+        expect(title!.declaredIn).toBe('/test/base.ts');
+
+        // The base-class member declaration is shared by BOTH subclasses
+        const sharing = analyzer.getAssociationsWithMember('title', title!.declaredIn!, title!.offset);
+        expect(sharing.map(a => a.className).sort()).toEqual(['CardA', 'CardB']);
+
+        // An own member fans out to its own class only
+        const onlyA = aAssoc.members.find(m => m.name === 'onlyA');
+        expect(onlyA).toBeDefined();
+        const onlyASharing = analyzer.getAssociationsWithMember('onlyA', '/test/a.ts', onlyA!.offset);
+        expect(onlyASharing.map(a => a.className)).toEqual(['CardA']);
+
+        // Wrong offset (a different declaration with the same name) matches nothing
+        expect(analyzer.getAssociationsWithMember('title', '/test/base.ts', title!.offset + 1)).toEqual([]);
+    });
+
+    // Regression: inherited-member records store the DECLARING file's offsets,
+    // captured when the SUBCLASS was analyzed. Editing the base file moved the
+    // declaration but left the subclass's SourceFile identity unchanged — the
+    // incremental pass skipped it, the stale offset no longer matched the fresh
+    // declaration, and the offset-keyed rename fan-out silently returned [].
+    describe('declaration-dependency invalidation', () => {
+        const baseV1 = `export class BaseCard { title: string = ''; }`;
+
+        function makeProject() {
+            const files = new Map<string, string>([
+                ['/test/base.ts', baseV1],
+                ['/test/a.ts', `
+                    import { BaseCard } from './base';
+                    @Container('./a.html')
+                    class CardA extends BaseCard {}
+                `],
+                ['/test/unrelated.ts', `
+                    @Container('./u.html')
+                    class Unrelated { note: string = ''; }
+                `],
+            ]);
+            return { files, ...buildInMemoryLsHarness(files) };
+        }
+
+        it('re-analyzes dependents when the declaring file changes, keeping fan-out offsets fresh', () => {
+            const { ls, edit } = makeProject();
+            analyzer.analyzeWithLanguageService(ls);
+
+            const staleOffset = analyzer.getAssociationsForTs('/test/a.ts')[0]
+                .members.find(m => m.name === 'title')!.offset;
+
+            // Shift the declaration by padding above the class.
+            const pad = '// padding line\n';
+            const baseV2 = pad + baseV1;
+            edit('/test/base.ts', baseV2);
+
+            const reanalyzed = analyzer.analyzeWithLanguageService(ls)!
+                .map(f => f.replace(/\\/g, '/'));
+            // The dependent subclass file is re-analyzed alongside the base…
+            expect(reanalyzed).toContain('/test/base.ts');
+            expect(reanalyzed).toContain('/test/a.ts');
+            // …but files with no stake in the base are not.
+            expect(reanalyzed).not.toContain('/test/unrelated.ts');
+
+            // The stored record now points at the FRESH declaration offset,
+            // so the offset-keyed fan-out still finds the subclass.
+            const freshOffset = baseV2.indexOf('title');
+            expect(freshOffset).toBe(staleOffset + pad.length);
+            const title = analyzer.getAssociationsForTs('/test/a.ts')[0]
+                .members.find(m => m.name === 'title')!;
+            expect(title.offset).toBe(freshOffset);
+            expect(
+                analyzer.getAssociationsWithMember('title', '/test/base.ts', freshOffset)
+                    .map(a => a.className)
+            ).toEqual(['CardA']);
+        });
+
+        it('reaches steady state — no re-analysis loop after the dependent catches up', () => {
+            const { ls, edit } = makeProject();
+            analyzer.analyzeWithLanguageService(ls);
+            edit('/test/base.ts', '// pad\n' + baseV1);
+            analyzer.analyzeWithLanguageService(ls);
+
+            // Nothing changed since — neither the base nor the dependent may
+            // re-analyze again.
+            expect(analyzer.analyzeWithLanguageService(ls)).toEqual([]);
+            expect(analyzer.analyzeWithLanguageService(ls)).toEqual([]);
+        });
+
+        it('does not re-analyze dependents when an unrelated file changes', () => {
+            const { ls, edit } = makeProject();
+            analyzer.analyzeWithLanguageService(ls);
+
+            edit('/test/unrelated.ts', `
+                @Container('./u.html')
+                class Unrelated { note: string = 'changed'; }
+            `);
+
+            const reanalyzed = analyzer.analyzeWithLanguageService(ls)!
+                .map(f => f.replace(/\\/g, '/'));
+            expect(reanalyzed).toEqual(['/test/unrelated.ts']);
+        });
+    });
+});
+
+// ---- Regression: #private (ECMAScript) fields surfaced as PUBLIC members —
+// completion offered `this.#foo`, a syntax error in template expressions ----
+describe('DecoratorAnalyzer — ECMAScript #private fields', () => {
+    it('does not surface #private fields as members at all', () => {
+        const analyzer = new DecoratorAnalyzer();
+        analyzer.analyzeSourceText('/test/priv.ts', `
+            @Container({ template: './p.html' })
+            class PrivContainer {
+                #secret: number = 1;
+                #hiddenMethod(): void {}
+                visible: string = '';
+            }
+        `);
+        const members = analyzer.getAssociationsForTs('/test/priv.ts')[0].members;
+        expect(members.find(m => m.name === '#secret')).toBeUndefined();
+        expect(members.find(m => m.name === '#hiddenMethod')).toBeUndefined();
+        expect(members.find(m => m.name === 'visible')).toBeDefined();
+    });
+});
+
+// ---- Regression: getTypeMembers' doc promised type-alias support but only
+// interface/class branches existed — `this.x.` with x: SomeAliasShape
+// silently yielded no members ----
+describe('DecoratorAnalyzer — type aliases with object shapes', () => {
+    const source = `
+        @Container({ template: './panel.html' })
+        class PanelContainer {
+            opts: PanelOpts | undefined;
+        }
+        type PanelOpts = {
+            width: number;
+            title: string;
+            refresh(): void;
+        };
+        type JustAString = string;
+    `;
+
+    function build() {
+        const analyzer = new DecoratorAnalyzer();
+        analyzer.analyzeSourceText('/test/panel.ts', source);
+        return analyzer;
+    }
+
+    it('getTypeMembers enumerates an object-shaped alias', () => {
+        const analyzer = build();
+        const members = analyzer.getTypeMembers('PanelOpts');
+        expect(members).toBeDefined();
+        expect(members!.map(m => m.name).sort()).toEqual(['refresh', 'title', 'width']);
+        expect(members!.find(m => m.name === 'refresh')!.kind).toBe('method');
+        expect(members!.find(m => m.name === 'width')!.type).toBe('number');
+    });
+
+    it('findMemberWithType resolves alias members (chain walking)', () => {
+        const analyzer = build();
+        const found = analyzer.findMemberWithType('PanelOpts', 'title');
+        expect(found).toBeDefined();
+        expect(found!.type).toBe('string');
+    });
+
+    it('findMemberInType locates the alias member declaration', () => {
+        const analyzer = build();
+        const loc = analyzer.findMemberInType('PanelOpts', 'width');
+        expect(loc).toBeDefined();
+        expect(loc!.filePath).toBe('/test/panel.ts');
+    });
+
+    it('non-object aliases yield no members (and no crash)', () => {
+        const analyzer = build();
+        expect(analyzer.getTypeMembers('JustAString')).toBeUndefined();
+    });
+});
+
+// ---- Regression: analyzer keys folded path case on EVERY platform — on a
+// case-sensitive FS (Linux) Foo.ts and foo.ts collided and removeFile on one
+// wiped the other's associations ----
+describe('DecoratorAnalyzer — path case sensitivity', () => {
+    const caseSensitive = ts.sys.useCaseSensitiveFileNames;
+
+    (caseSensitive ? it : it.skip)('keeps differently-cased paths distinct on case-sensitive file systems', () => {
+        const analyzer = new DecoratorAnalyzer();
+        analyzer.analyzeSourceText('/test/Foo.ts', `
+            @Container({ template: './a.html' })
+            class FooA { a: string = ''; }
+        `);
+        analyzer.analyzeSourceText('/test/foo.ts', `
+            @Container({ template: './b.html' })
+            class FooB { b: string = ''; }
+        `);
+        expect(analyzer.getAssociationsForTs('/test/Foo.ts').map(a => a.className)).toEqual(['FooA']);
+        expect(analyzer.getAssociationsForTs('/test/foo.ts').map(a => a.className)).toEqual(['FooB']);
+
+        analyzer.removeFile('/test/foo.ts');
+        expect(analyzer.getAssociationsForTs('/test/foo.ts')).toHaveLength(0);
+        expect(analyzer.getAssociationsForTs('/test/Foo.ts')).toHaveLength(1);
+    });
+
+    (!caseSensitive ? it : it.skip)('folds path case on case-insensitive file systems', () => {
+        const analyzer = new DecoratorAnalyzer();
+        analyzer.analyzeSourceText('/test/Foo.ts', `
+            @Container({ template: './a.html' })
+            class FooA { a: string = ''; }
+        `);
+        expect(analyzer.getAssociationsForTs('/test/FOO.ts').map(a => a.className)).toEqual(['FooA']);
+    });
+});
+
+// ---- Round 3 (L3): @AppRoot is not a runtime container ----
+// The framework's AppRoot decorator only calls Environment.setupRouter +
+// Environment.addApp — it never registers a container, so offering the class
+// for nb-container="@…" completion/navigation blessed a name that can never
+// resolve at runtime.
+describe('DecoratorAnalyzer — AppRoot entity registration (round 3)', () => {
+    it('does not register an @AppRoot class as a container entity', () => {
+        const analyzer = new DecoratorAnalyzer();
+        analyzer.analyzeSourceText('/test/app-root-entity.ts', `
+            @AppRoot('#app')
+            class ShellRoot { x: string = ''; }
+        `);
+        // The association exists (member/template features still work) …
+        expect(analyzer.getAssociationsForTs('/test/app-root-entity.ts')).toHaveLength(1);
+        // … but no container entity is registered for it.
+        const containers = analyzer.getEntitiesByType('container');
+        expect(containers.find(e => e.className === 'ShellRoot')).toBeUndefined();
+    });
+
+    it('still registers @Container classes as container entities', () => {
+        const analyzer = new DecoratorAnalyzer();
+        analyzer.analyzeSourceText('/test/real-container.ts', `
+            @Container('<div></div>')
+            class RealContainer { }
+        `);
+        expect(analyzer.getEntitiesByType('container').map(e => e.className)).toContain('RealContainer');
+    });
+});
+
+// ---- Round 3 (L8): program-path analysis must be idempotent ----
+// analyzeFiles/analyzeProgram registered associations and entities without
+// clearing previous state — a second call (or a file reachable from two
+// groups' programs) duplicated everything.
+describe('DecoratorAnalyzer — analyzeFiles idempotence (round 3)', () => {
+    const fsMod = require('fs');
+    const pathMod = require('path');
+    const os = require('os');
+
+    it('analyzing the same file twice does not duplicate associations or entities', () => {
+        const tmp = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), 'nubond-analyze-twice-'));
+        try {
+            const tsPath = pathMod.join(tmp, 'card.ts');
+            fsMod.writeFileSync(tsPath, `
+                @Container('<div></div>')
+                class Card { x: string = ''; }
+            `, 'utf-8');
+            const analyzer = new DecoratorAnalyzer();
+            const options: ts.CompilerOptions = {
+                target: ts.ScriptTarget.ES2020,
+                experimentalDecorators: true,
+                noEmit: true,
+                skipLibCheck: true,
+            };
+            analyzer.analyzeFiles([tsPath], options);
+            analyzer.analyzeFiles([tsPath], options);
+            expect(analyzer.getAssociationsForTs(tsPath)).toHaveLength(1);
+            expect(analyzer.getEntitiesByType('container').filter(e => e.className === 'Card')).toHaveLength(1);
+        } finally {
+            try { fsMod.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
+        }
+    });
+});
+
+// ---- Round 3 (L9): declChangeTicks pruned when a file leaves all programs ----
+describe('DecoratorAnalyzer — declChangeTicks pruning (round 3)', () => {
+    const tsMod = require('typescript');
+
+    function buildMutableLs(fileMap: Record<string, string>) {
+        const files = new Map(Object.entries(fileMap));
+        const versions = new Map<string, number>();
+        for (const f of files.keys()) versions.set(f, 0);
+        const host: any = {
+            getScriptFileNames: () => Array.from(files.keys()),
+            getScriptVersion: (f: string) => String(versions.get(f) ?? 0),
+            getScriptSnapshot: (f: string) => {
+                const text = files.get(f);
+                return text !== undefined ? tsMod.ScriptSnapshot.fromString(text) : undefined;
+            },
+            getCompilationSettings: () => ({
+                target: tsMod.ScriptTarget.ES2020,
+                module: tsMod.ModuleKind.CommonJS,
+                experimentalDecorators: true,
+                skipLibCheck: true,
+                noEmit: true,
+            }),
+            getDefaultLibFileName: (opts: any) => tsMod.getDefaultLibFilePath(opts),
+            fileExists: (f: string) => files.has(f) || tsMod.sys.fileExists(f),
+            readFile: (f: string) => files.get(f) ?? tsMod.sys.readFile(f),
+            getCurrentDirectory: () => '/test',
+            useCaseSensitiveFileNames: () => true,
+            getNewLine: () => '\n',
+        };
+        return {
+            ls: tsMod.createLanguageService(host, tsMod.createDocumentRegistry()),
+            files,
+            bumpVersion: (f: string) => versions.set(f, (versions.get(f) ?? 0) + 1),
+        };
+    }
+
+    it('drops the change tick once the last claimant drops the file', () => {
+        const group = buildMutableLs({
+            '/proj/keep.ts': `@Container('<div></div>') class Keep { }`,
+            '/proj/gone.ts': `@Container('<div></div>') class Gone { }`,
+        });
+        const analyzer = new DecoratorAnalyzer();
+        analyzer.analyzeWithLanguageService(group.ls);
+
+        const ticks = (analyzer as any).declChangeTicks as Map<string, number>;
+        expect(ticks.has('/proj/gone.ts')).toBe(true);
+
+        // The file leaves the program (deleted) — the next pass evicts it.
+        group.files.delete('/proj/gone.ts');
+        group.bumpVersion('/proj/keep.ts');
+        analyzer.analyzeWithLanguageService(group.ls);
+
+        expect(ticks.has('/proj/gone.ts')).toBe(false);
+        // Files still claimed keep their tick (dependent invalidation intact).
+        expect(ticks.has('/proj/keep.ts')).toBe(true);
     });
 });

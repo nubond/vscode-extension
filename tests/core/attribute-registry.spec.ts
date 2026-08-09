@@ -34,18 +34,36 @@ describe('attribute-registry', () => {
             expect(info!.attribute).toBe('nb-value');
         });
 
-        it('should not resolve data-nb-event:click (colon checked before data- strip)', () => {
-            // The colon-based prefix extraction runs before data- stripping,
-            // so "data-nb-event:click" → base "data-nb-event" → not found
+        it('should resolve data-nb-event:click by falling through to the data- strip', () => {
+            // Mixed form — not something either mode produces, but the
+            // template parser normalizes any data-nb-* name, so getHandlerInfo
+            // must resolve it consistently instead of dead-ending on the
+            // colon branch.
             const info = getHandlerInfo('data-nb-event:click');
-            expect(info).toBeUndefined();
+            expect(info).toBeDefined();
+            expect(info!.attribute).toBe('nb-event');
         });
 
-        it('should resolve data-nb-event--click with double dash', () => {
-            // data-nb-event--click → strip data- → nb-event--click
-            // Note: this depends on whether -- is handled as a colon replacement
-            const info = getHandlerInfo('data-nb-value');
+        it('should resolve data-nb-event--click (W3C double-dash separator)', () => {
+            // W3C compliance mode flips the meta separator from ':' to '--':
+            // data-nb-event--click → nb-event:click → nb-event.
+            const info = getHandlerInfo('data-nb-event--click');
             expect(info).toBeDefined();
+            expect(info!.attribute).toBe('nb-event');
+        });
+
+        it('should resolve W3C suffixed forms for every prefix attribute', () => {
+            for (const attr of PREFIX_ATTRIBUTES) {
+                const info = getHandlerInfo(`data-${attr}--something`);
+                expect(info).toBeDefined();
+                expect(info!.attribute).toBe(attr);
+            }
+        });
+
+        it('should resolve data-nb-in-ref--user-id (kebab suffix with W3C separator)', () => {
+            const info = getHandlerInfo('data-nb-in-ref--user-id');
+            expect(info).toBeDefined();
+            expect(info!.attribute).toBe('nb-in-ref');
         });
 
         it('should return undefined for unknown attribute', () => {
@@ -269,6 +287,21 @@ describe('attribute-registry', () => {
             expect((refInfo.description + ' ' + (refInfo.notes ?? '')).toLowerCase()).toMatch(/reference|clone/);
         });
 
+        it('nb-html is documented as unsanitized by default', () => {
+            // The old description implied the value "is passed through the
+            // htmlSanitizer" unconditionally — the default sanitizer is an
+            // identity pass-through, so nb-html is an XSS sink out of the box.
+            const info = getHandlerInfo('nb-html')!;
+            expect(info.description.toLowerCase()).toContain('unsanitized by default');
+            expect(info.description).not.toContain('is passed through the `htmlSanitizer`');
+        });
+
+        it('nb-in note reads correctly (no "does not sees" typo)', () => {
+            const info = getHandlerInfo('nb-in')!;
+            expect(info.notes ?? '').not.toContain('does not sees');
+            expect((info.notes ?? '').toLowerCase()).toContain('clone');
+        });
+
         it('nb-projection / nb-project-to / nb-project-instead are non-prefix, value-as-slot-name attributes', () => {
             for (const name of ['nb-projection', 'nb-project-to', 'nb-project-instead']) {
                 const info = getHandlerInfo(name)!;
@@ -299,6 +332,97 @@ describe('attribute-registry', () => {
             expect(info.formats?.some(f => /;/.test(f))).toBe(true);
             expect(info.examples.some(ex => /\[.*;.*\]/.test(ex))).toBe(true);
             expect(info.examples.some(ex => /\{.*;.*\}/.test(ex))).toBe(true);
+        });
+    });
+
+    // ---- Round 6 (E7/E4/E8): prefix-list corrections + refreshed notes ----
+    describe('registry prefix corrections (round 6)', () => {
+        it('nb-style lists NO whole-value prefixes — entries are split before any prefix could apply', () => {
+            const info = getHandlerInfo('nb-style')!;
+            expect(info.prefixes).toHaveLength(0);
+            expect(info.notes ?? '').toMatch(/whole-value/i);
+            expect(info.notes ?? '').toContain('#opacity');
+        });
+
+        it('nb-switch and nb-case support # (both funnel through processExpressionExecution)', () => {
+            expect(getHandlerInfo('nb-switch')!.prefixes.map(p => p.char)).toContain('#');
+            const caseChars = getHandlerInfo('nb-case')!.prefixes.map(p => p.char);
+            expect(caseChars).toContain('#');
+            expect(caseChars).toContain('@');
+        });
+
+        it('@ constant is documented on nb-html, nb-if, nb-exec, nb-event, nb-in, nb-in-ref', () => {
+            for (const name of ['nb-html', 'nb-if', 'nb-exec', 'nb-event', 'nb-in', 'nb-in-ref']) {
+                expect(getHandlerInfo(name)!.prefixes.map(p => p.char)).toContain('@');
+            }
+        });
+
+        it('nb-prop blocklist documentation includes outerHTML (framework fix #3, 2026-07-13)', () => {
+            expect(getHandlerInfo('nb-prop')!.notes ?? '').toContain('outerHTML');
+        });
+
+        it('nb-html note documents the global-sanitizer fallback as working (framework fix #1), with the pre-fix-build caveat', () => {
+            const notes = getHandlerInfo('nb-html')!.notes ?? '';
+            // The old note asserted the global sanitizer is "currently NOT
+            // applied" — that framework bug was fixed in src/ on 2026-07-13.
+            expect(notes).not.toMatch(/currently NOT applied/i);
+            expect(notes).toContain('IGlobalConfig.htmlSanitizer');
+            expect(notes).toMatch(/per-context sanitizer wins/i);
+            expect(notes).toMatch(/before 2026-07-13/);
+        });
+    });
+
+    // ---- Round 4b: full help-content verification against the framework ----
+    describe('framework-parity doc details (round 4b)', () => {
+        it('router injected param is plain Router — the param does not exist when routing is unconfigured', () => {
+            const info = getHandlerInfo('nb-event')!;
+            const router = info.injectedParams.find(p => p.name === 'router')!;
+            expect(router.type).toBe('Router');
+            expect(router.description).toMatch(/ReferenceError/);
+        });
+
+        it('nb-attr documents the boolean-false trap (stringified, attribute stays active)', () => {
+            const info = getHandlerInfo('nb-attr')!;
+            expect(info.notes ?? '').toMatch(/false/);
+            expect(info.notes ?? '').toMatch(/null/);
+        });
+
+        it('nb-style documents kebab-case-only property names and the !important limitation', () => {
+            const info = getHandlerInfo('nb-style')!;
+            expect(info.notes ?? '').toMatch(/kebab/i);
+            expect(info.notes ?? '').toMatch(/!important/);
+        });
+
+        it('nb-switch and nb-case document stringified matching', () => {
+            expect(getHandlerInfo('nb-switch')!.notes ?? '').toMatch(/STRINGIFIED/i);
+            expect(getHandlerInfo('nb-case')!.expressionType).toMatch(/stringified/i);
+        });
+
+        it('nb-repeat documents the lowercase prefix requirement', () => {
+            const info = getHandlerInfo('nb-repeat')!;
+            expect(info.suffixDescription ?? '').toMatch(/lowercase/i);
+            expect(info.namedPrefixInfo ?? '').toMatch(/lowercase/i);
+        });
+
+        it('nb-container supports the # single-bind prefix (parser + runtime parity)', () => {
+            const chars = getHandlerInfo('nb-container')!.prefixes.map(p => p.char);
+            expect(chars).toContain('#');
+        });
+
+        it('nb-value documents the stringification rules', () => {
+            expect(getHandlerInfo('nb-value')!.notes ?? '').toMatch(/JSON\.stringify/);
+        });
+
+        it('nb-repeat documents Map/Set-only iteration and entry-tuple items', () => {
+            const info = getHandlerInfo('nb-repeat')!;
+            expect(info.description).not.toMatch(/other iterables\)/);
+            expect(info.notes ?? '').toMatch(/\[key, value\]/);
+        });
+
+        it('nb-in documents the in-place-mutation and clone-failure delivery caveats', () => {
+            const notes = getHandlerInfo('nb-in')!.notes ?? '';
+            expect(notes).toMatch(/in place|in-place|same object/i);
+            expect(notes).toMatch(/nb-in-ref/);
         });
     });
 });

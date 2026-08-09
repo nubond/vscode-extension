@@ -93,11 +93,15 @@ export function arePathsEqual(a: string, b: string): boolean {
  * in any term silently misaligned highlights and renames by a few characters.
  */
 export function getAbsoluteMemberRange(
-    binding: { valueSpan: { start: number }; expressionPrefix?: string },
+    binding: { valueSpan: { start: number }; expressionPrefix?: string; expressionOffset?: number },
     ref: { start: number; rootMember: string }
 ): { start: number; end: number } {
-    const prefixLen = binding.expressionPrefix ? 1 : 0;
-    const start = binding.valueSpan.start + prefixLen + ref.start + THIS_PREFIX_LEN;
+    // The runtime trims values before prefix detection, so a prefix may sit
+    // after leading whitespace — `expressionOffset` (index of the expression
+    // inside the raw value) is authoritative; `prefix ? 1 : 0` is kept only
+    // as a fallback for hand-built binding literals in tests.
+    const exprOffset = binding.expressionOffset ?? (binding.expressionPrefix ? 1 : 0);
+    const start = binding.valueSpan.start + exprOffset + ref.start + THIS_PREFIX_LEN;
     return { start, end: start + ref.rootMember.length };
 }
 
@@ -140,7 +144,10 @@ export function resolveChainType(
 
     for (let i = 1; i < chain.length; i++) {
         const found = findMemberWithType(currentType, chain[i]);
-        if (!found) return currentType;
+        // Fail closed: returning the parent's type here made
+        // `this.user.nonExistent` report as `User` — wrong hover types and
+        // wrong inferred nb-repeat item types.
+        if (!found) return undefined;
         currentType = found.type;
     }
     return currentType;
@@ -152,10 +159,20 @@ export function resolveChainType(
  */
 export function inferItemType(collectionType: string): string {
     const stripped = collectionType.replace(/\s*\|\s*(undefined|null)\s*/g, '').trim();
-    const arrayGenericMatch = stripped.match(/^Array<(.+)>$/);
-    if (arrayGenericMatch) return arrayGenericMatch[1];
+    // Array<T> / ReadonlyArray<T> / Set<T> / ReadonlySet<T> — nb-repeat
+    // iterates the element/entry type directly.
+    const genericMatch = stripped.match(/^(?:Readonly)?(?:Array|Set)<(.+)>$/);
+    if (genericMatch) return genericMatch[1];
+    // Map / ReadonlyMap: the runtime converts via `Array.from(map)`, so each
+    // repeat item is a `[key, value]` ENTRY TUPLE — not the value type.
+    const mapMatch = stripped.match(/^(?:Readonly)?Map<(.+)>$/);
+    if (mapMatch) return `[${mapMatch[1]}]`;
     const arrayBracketMatch = stripped.match(/^(.+)\[\]$/);
     if (arrayBracketMatch) return arrayBracketMatch[1];
+    // Typed arrays yield numbers (BigInt64/BigUint64 yield bigints)
+    if (/^(?:Int8|Uint8|Uint8Clamped|Int16|Uint16|Int32|Uint32|Float32|Float64)Array$/.test(stripped)) return 'number';
+    if (/^Big(?:Int64|Uint64)Array$/.test(stripped)) return 'bigint';
+    // string iterates characters; a positive number generates item = 1..N
     if (stripped === 'string') return 'string';
     if (stripped === 'number') return 'number';
     return 'any';

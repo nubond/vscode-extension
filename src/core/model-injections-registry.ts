@@ -49,7 +49,7 @@ const MODEL_INJECTIONS: ModelInjection[] = [
                     { name: 'has', type: '(attributeName: string) => boolean', desc: 'Check if element has attribute', kind: 'method' },
                     { name: 'get', type: '(attributeName: string) => string | undefined', desc: 'Get element attribute value', kind: 'method' },
                     { name: 'getAll', type: '() => Map<string, string | undefined>', desc: 'Get all element attributes', kind: 'method' },
-                    { name: 'set', type: '(attributeName: string, attributeValue?: string | null) => void', desc: 'Set element attribute value', kind: 'method' },
+                    { name: 'set', type: '(attributeName: string, attributeValue?: string | null) => void', desc: 'Set element attribute value; `null` / `undefined` removes the attribute', kind: 'method' },
                     { name: 'remove', type: '(attributeName: string) => void', desc: 'Remove element attribute', kind: 'method' },
                 ],
             },
@@ -60,7 +60,7 @@ const MODEL_INJECTIONS: ModelInjection[] = [
                     { name: 'has', type: '(propertyName: string) => boolean', desc: 'Check if element has style', kind: 'method' },
                     { name: 'get', type: '(propertyName: string) => string | undefined', desc: 'Get element style value', kind: 'method' },
                     { name: 'getAll', type: '() => Map<string, string>', desc: 'Get all element styles', kind: 'method' },
-                    { name: 'set', type: '(propertyName: string, propertyValue?: string | null) => void', desc: 'Set element style value', kind: 'method' },
+                    { name: 'set', type: '(propertyName: string, propertyValue?: string | null) => void', desc: 'Set element style value (kebab-case property name); `null` / `undefined` / `\'\'` removes it', kind: 'method' },
                     { name: 'remove', type: '(propertyName: string) => void', desc: 'Remove element style', kind: 'method' },
                 ],
             },
@@ -82,9 +82,7 @@ const MODEL_INJECTIONS: ModelInjection[] = [
         type: 'ElementSubscriptions',
         desc: 'Subscribe to DOM events on the host element',
         members: [
-            { name: 'isSubscribed', type: '(eventName: string) => boolean', desc: 'Check if currently subscribed to an event', kind: 'method' },
-            { name: 'isUnSubscribed', type: '(eventName: string) => boolean', desc: 'Check if unsubscribed from an event after a prior subscription', kind: 'method' },
-            { name: 'subscribe', type: '(eventName: string, callback: (evt: Event) => any, options?: boolean | AddEventListenerOptions, debounce?: number) => () => void', desc: 'Subscribe to a DOM event. Returns an unsubscribe function', kind: 'method' },
+            { name: 'subscribe', type: '(eventName: string, callback: (evt: Event) => any, options?: boolean | AddEventListenerOptions, debounce?: number) => () => void', desc: 'Subscribe to a DOM event. Returns the unsubscribe function of this subscription', kind: 'method' },
         ],
     },
     {
@@ -93,6 +91,23 @@ const MODEL_INJECTIONS: ModelInjection[] = [
         desc: 'Dispatch custom events from the host element',
         members: [
             { name: 'dispatch', type: '(nameOrEvent: string | Event, data?: any) => boolean', desc: 'Dispatch a custom event or named event with optional detail data', kind: 'method' },
+        ],
+    },
+    {
+        name: 'router',
+        type: 'Router',
+        desc: 'Application router — navigate between route states and observe state changes',
+        members: [
+            { name: 'isConfigured', type: 'boolean', desc: 'Whether the router has been configured with a route template', kind: 'property' },
+            { name: 'hashBased', type: 'boolean', desc: 'Whether the router uses hash-based routing (`/#/…`)', kind: 'property' },
+            { name: 'path', type: 'string | undefined', desc: 'The current route path built from the route template and state', kind: 'property' },
+            { name: 'state', type: '{[key: string]: string | undefined} | undefined', desc: 'The current route state (slot name → value)', kind: 'property' },
+            { name: 'go', type: '(state?: {[key: string]: string | number | null | undefined} | string, partialState?: boolean, removeHistory?: boolean) => void', desc: 'Navigate to a new route state', kind: 'method' },
+            { name: 'goBack', type: '() => void', desc: 'Navigate back in the router history', kind: 'method' },
+            { name: 'goForward', type: '() => void', desc: 'Navigate forward in the router history', kind: 'method' },
+            { name: 'goTo', type: '(offset: number) => void', desc: 'Navigate to a history entry relative to the current one', kind: 'method' },
+            { name: 'onBeforeStateChange', type: '(callBack: (preventChange: () => void, oldState: object, newState: object, oldPath: string, newPath: string) => void) => () => void', desc: 'Register a callback invoked before a state change. Returns an unsubscribe function', kind: 'method' },
+            { name: 'onAfterStateChange', type: '(callBack: (oldState: object, newState: object, oldPath: string, newPath: string) => void) => () => void', desc: 'Register a callback invoked after a state change. Returns an unsubscribe function', kind: 'method' },
         ],
     },
 ];
@@ -105,6 +120,18 @@ export function getAllModelInjections(): ModelInjection[] {
 /** Find a model injection by property name (e.g. 'changeDetector'). */
 export function getModelInjection(name: string): ModelInjection | undefined {
     return MODEL_INJECTIONS.find(i => i.name === name);
+}
+
+/**
+ * Find a model injection by its TypeScript type (e.g. 'ChangeDetector').
+ * DI is constructor-parameter based — the instance property is whatever the
+ * user named the parameter — so resolving by the member's declared TYPE is
+ * the reliable way to attach injection docs/members to `this.<anything>`.
+ * Union/undefined suffixes (`Router | undefined`) are tolerated.
+ */
+export function getModelInjectionByType(type: string): ModelInjection | undefined {
+    const clean = type.replace(/\s*\|\s*(undefined|null)\s*/g, '').trim();
+    return MODEL_INJECTIONS.find(i => i.type === clean);
 }
 
 /** Find a member of a model injection, or a sub-member via dotted path. */

@@ -65,7 +65,7 @@ const EVENT_INJECTED_PARAMS: InjectedParam[] = [
     { name: 'event', type: 'Event', description: 'The native DOM Event object.' },
     { name: 'data', type: 'any', description: 'Custom event detail payload (event.detail).' },
     { name: 'unSubscribe', type: '() => void', description: 'Call to manually unsubscribe from this event.' },
-    { name: 'router', type: 'Router | undefined', description: 'Router instance, if routing is configured.' },
+    { name: 'router', type: 'Router', description: 'The application Router. Only injected when routing is configured — in an app without a configured router the parameter does not exist, and referencing `router` is a runtime ReferenceError (not `undefined`).' },
     { name: 'nativeElement', type: 'Element', description: 'The native DOM element.' }
 ];
 
@@ -94,21 +94,23 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-value="#this.name"',
             'nb-value="@Hello World"',
             'nb-value="`Hello, ${this.name}!`"'
-        ]
+        ],
+        notes: 'Non-string results are stringified: numbers/booleans/bigints via template conversion, objects via `JSON.stringify`; `undefined`, `null`, functions, and symbols render as an empty string.'
     },
     {
         attribute: 'nb-html',
         displayName: 'HTML Binding',
-        description: 'Binds the result of an expression to the element\'s `innerHTML`. The value is passed through the `htmlSanitizer` configured on `IContextConfig` / `IGlobalConfig`.',
+        description: 'Binds the result of an expression to the element\'s `innerHTML`. **Unsanitized by default** — the value only passes through a sanitizer if one is registered as `htmlSanitizer` on `IContextConfig` / `IGlobalConfig`.',
         expressionType: 'string (HTML)',
         isPrefix: false,
-        prefixes: [SINGLE_BIND_PREFIX],
+        prefixes: [SINGLE_BIND_PREFIX, CONSTANT_PREFIX],
         injectedParams: [],
         examples: [
             'nb-html="this.richContent"',
-            'nb-html="#this.staticHtml"'
+            'nb-html="#this.staticHtml"',
+            'nb-html="@<b>static markup</b>"'
         ],
-        notes: 'Raw HTML injection. The default `htmlSanitizer` is an identity function (pass-through) — register a real sanitizer in `IContextConfig.htmlSanitizer` (or `IGlobalConfig.htmlSanitizer`) to prevent XSS.'
+        notes: 'Raw HTML injection — there is NO sanitization by default. Register a real sanitizer as `IContextConfig.htmlSanitizer` (per container/component) or `IGlobalConfig.htmlSanitizer` (app-wide fallback) to prevent XSS; when both are set, the per-context sanitizer wins. Caveat: framework builds published before 2026-07-13 ship a bug where the GLOBAL sanitizer was not applied to `nb-html` — only the per-context one; with such a build, configure the sanitizer per context.'
     },
     {
         attribute: 'nb-class',
@@ -129,7 +131,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-class="{active: this.isActive; hidden: this.isHidden}"',
             'nb-class="@my-static-class"'
         ],
-        notes: 'Trailing or empty entries inside `[ ]` / `{ }` are filtered out.'
+        notes: 'Trailing or empty entries inside `[ ]` / `{ }` are filtered out; escape a literal `;` inside an entry as `\\;`.'
     },
     {
         attribute: 'nb-style',
@@ -137,14 +139,14 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
         description: 'Dynamically binds inline CSS styles to an element. Multiple properties are separated by `;`. Each entry may use the `#` single-bind prefix on its own expression.',
         expressionType: 'prop: expression; prop: expression',
         isPrefix: false,
-        prefixes: [SINGLE_BIND_PREFIX],
+        prefixes: [],
         injectedParams: [],
         examples: [
             'nb-style="opacity: this.fade; color: this.textColor"',
             'nb-style="opacity: #this.initialOpacity; color: this.textColor"',
             'nb-style="background-color: this.themeBg"'
         ],
-        notes: 'Trailing or empty entries are filtered out. Evaluating a property to `null` or `undefined` removes it from the inline style.'
+        notes: 'There is NO whole-value expression prefix: the runtime splits `prop: expr` entries FIRST, so a leading `#` becomes part of the first property name (`#opacity` — a silent dead style). Put the `#` single-bind prefix on an entry\'s own expression instead (`opacity: #expr`). Trailing or empty entries are filtered out; escape a literal `;` in a value as `\\;`. Evaluating a property to `null`, `undefined`, or `\'\'` removes it from the inline style. Property names must be KEBAB-CASE (`background-color`) — the runtime passes them to `style.setProperty()` verbatim, so a camelCase name (`backgroundColor`) is a silent no-op. Values containing `!important` are also silently ignored (a `setProperty` limitation).'
     },
     {
         attribute: 'nb-attr',
@@ -161,7 +163,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-attr:aria-label="this.label"',
             'nb-attr:open="this.isOpen ? \'\' : null"'
         ],
-        notes: 'Cannot bind to `class` (use `nb-class`) or `style` (use `nb-style`); framework-reserved `nb-*` / `data-nb-*` attribute names are rejected.'
+        notes: 'Cannot bind to `class` (use `nb-class`) or `style` (use `nb-style`); framework-reserved `nb-*` / `data-nb-*` attribute names are rejected. Only `null` / `undefined` REMOVE the attribute — `false` is stringified to the literal `"false"`, which keeps boolean attributes like `disabled` / `checked` / `readonly` ACTIVE. Map booleans yourself: `this.flag ? \'\' : null`.'
     },
     {
         attribute: 'nb-prop',
@@ -177,7 +179,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-prop:value="this.inputValue"',
             'nb-prop:selected-index="this.activeIndex"'
         ],
-        notes: 'Cannot bind to `className`, `classList`, `style`, `textContent`, `innerText`, or `innerHTML` — use the dedicated `nb-class` / `nb-style` / `nb-value` / `nb-html` handlers instead.'
+        notes: 'Cannot bind to `className`, `classList`, `style`, `textContent`, `innerText`, or `innerHTML` — use the dedicated `nb-class` / `nb-style` / `nb-value` / `nb-html` handlers instead. `outerHTML` is also rejected (it cannot be changed through the framework at all).'
     },
     {
         attribute: 'nb-if',
@@ -185,52 +187,53 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
         description: 'Conditionally shows or hides the element based on a boolean expression. When false, the element is hidden (a CSS class is applied).',
         expressionType: 'boolean',
         isPrefix: false,
-        prefixes: [SINGLE_BIND_PREFIX],
+        prefixes: [SINGLE_BIND_PREFIX, CONSTANT_PREFIX],
         injectedParams: [],
         examples: [
             'nb-if="this.isVisible"',
             'nb-if="#this.showOnce"',
-            'nb-if="this.items.length > 0"'
+            'nb-if="this.items.length > 0"',
+            'nb-if="@false"  <!-- constant: `@true` / `@false` are real booleans -->'
         ]
     },
     {
         attribute: 'nb-repeat',
         displayName: 'Repeat / Loop',
-        description: 'Repeats the element for each entry in a collection. Supports arrays, typed arrays, strings, `Map` / `Set` (and other iterables), positive numbers (generates `item = 1..N`), and plain objects (iterates own property values).',
-        expressionType: 'Array | TypedArray | string | number | Iterable | Object',
+        description: 'Repeats the element for each entry in a collection. Supports arrays, typed arrays, strings, `Map` / `Set` (specifically — other iterables such as generators are NOT special-cased and fall into the plain-object path, repeating 0 times), positive numbers (generates `item = 1..N`), and plain objects (iterates own property values).',
+        expressionType: 'Array | TypedArray | string | number | Map | Set | Object',
         isPrefix: true,
-        suffixDescription: 'Optional named prefix for nested loops (e.g., `nb-repeat:outer`). Injected parameters become prefixed: `outerItem`, `outerIndex`, `outerCount`. The prefix is rejected if it collides with a registered `@Transformer` name.',
+        suffixDescription: 'Optional named prefix for nested loops (e.g., `nb-repeat:outer`). Injected parameters become prefixed: `outerItem`, `outerIndex`, `outerCount`. Write the prefix in all-lowercase letters: the browser lowercases attribute names, and the runtime uses the lowercased remainder verbatim (`nb-repeat:myList` injects `mylistItem`; a kebab-case prefix produces invalid identifiers and breaks every expression in the subtree). The prefix is rejected if it collides with a registered `@Transformer` name.',
         prefixes: [SINGLE_BIND_PREFIX],
         injectedParams: REPEAT_INJECTED_PARAMS,
-        namedPrefixInfo: 'With `nb-repeat:PREFIX`, injected params become `PREFIXItem`, `PREFIXIndex`, `PREFIXCount`. This enables nested loops without variable-name collisions.',
+        namedPrefixInfo: 'With `nb-repeat:PREFIX`, injected params become `PREFIXItem`, `PREFIXIndex`, `PREFIXCount` (the prefix is the browser-lowercased attribute remainder, used verbatim — keep it all-lowercase). This enables nested loops without variable-name collisions.',
         examples: [
             'nb-repeat="this.items"',
             'nb-repeat:outer="this.groups"',
             'nb-repeat="5"  <!-- repeats 5 times, item = 1..5, index = 0..4 -->',
             'nb-repeat="#this.snapshot"  <!-- iterate once, then freeze -->'
         ],
-        notes: 'For plain-object data, `item` is each own-property value (not the key).'
+        notes: 'For plain-object data, `item` is each own-property value (not the key). For `Map` data, `item` is the `[key, value]` entry tuple (the runtime converts via `Array.from`).'
     },
     {
         attribute: 'nb-switch',
         displayName: 'Switch Statement',
         description: 'Evaluates an expression and shows the matching `nb-case` child element. Works together with `nb-case` and `nb-default`.',
-        expressionType: 'any (compared via equality)',
+        expressionType: 'any (matched by STRINGIFIED value)',
         isPrefix: false,
-        prefixes: [],
+        prefixes: [SINGLE_BIND_PREFIX],
         injectedParams: [],
         examples: [
             'nb-switch="this.status"'
         ],
-        notes: 'Child elements should use `nb-case` or `nb-default`.'
+        notes: 'Child elements should use `nb-case` or `nb-default`. Matching compares STRINGIFIED values: the number `5` matches the string `\'5\'`, and `undefined`, `null`, and `\'\'` all stringify to the empty string — a "nothing selected" switch value activates an empty-string case instead of `nb-default`.'
     },
     {
         attribute: 'nb-case',
         displayName: 'Switch Case',
-        description: 'A case branch inside an `nb-switch`. Visible when the case value matches the parent switch expression.',
-        expressionType: 'any (matched against parent nb-switch value)',
+        description: 'A case branch inside an `nb-switch`. Visible when the case value matches the parent switch expression (STRINGIFIED comparison — see `nb-switch`).',
+        expressionType: 'any (matched by stringified value against the parent nb-switch)',
         isPrefix: false,
-        prefixes: [CONSTANT_PREFIX],
+        prefixes: [CONSTANT_PREFIX, SINGLE_BIND_PREFIX],
         injectedParams: [],
         examples: [
             'nb-case="@active"',
@@ -259,7 +262,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
         expressionType: 'void | Promise<void>',
         isPrefix: true,
         suffixDescription: 'Event name (e.g., `click`, `input`, `mouseover`). Optional debounce in milliseconds: `nb-event:click:300`.',
-        prefixes: [SINGLE_BIND_PREFIX],
+        prefixes: [SINGLE_BIND_PREFIX, CONSTANT_PREFIX],
         injectedParams: EVENT_INJECTED_PARAMS,
         examples: [
             'nb-event:click="this.onClick()"',
@@ -268,12 +271,12 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-event:click="this.router.go(\'home\'), event.preventDefault()"',
             'nb-event:click="#this.handleOnce()"  <!-- one-time, auto-unsubscribes -->'
         ],
-        notes: 'With `#` prefix, the event auto-unsubscribes after the first trigger. Call `unSubscribe()` for manual control. If the handler returns a `Promise`, a change-detection cycle is automatically scheduled when it settles, otherwise change-detection cycle is automatically scheduled after expression execution.'
+        notes: 'With `#` prefix, the event auto-unsubscribes after the first trigger — but note: if the handler returns a Promise that REJECTS, the auto-unsubscribe is skipped and the handler can fire again. Call `unSubscribe()` for manual control. If the handler returns a `Promise`, a change-detection cycle is automatically scheduled when it settles, otherwise change-detection cycle is automatically scheduled after expression execution. Two `nb-event` attributes resolving to the same event name overwrite each other — only one handler ends up subscribed.'
     },
     {
         attribute: 'nb-var',
         displayName: 'Local Variable',
-        description: 'Defines a local variable available in expressions of the current element (after this attribute) and all descendants. Multiple sibling `nb-var` attributes are evaluated left-to-right, so a later one can reference earlier ones.',
+        description: 'Defines a local variable available in the other expressions on the current element (except `nb-repeat`, which evaluates BEFORE the element\'s variables exist) and in all descendants. `nb-case`/`nb-default` expressions also cannot see the case element\'s own variables (they evaluate with the parent switch\'s scope). Multiple sibling `nb-var` attributes are evaluated left-to-right, so a later one can reference earlier ones; the first one sees no sibling variables at all.',
         expressionType: 'any',
         isPrefix: true,
         suffixDescription: 'The variable name to define. Kebab-cased names are converted to camelCase (e.g., `nb-var:total-count` → `totalCount`).',
@@ -292,7 +295,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
         description: 'Executes an expression on every change-detection cycle without producing any DOM output. Useful for side effects. Use the `#` single-bind prefix to run it once.',
         expressionType: 'void',
         isPrefix: false,
-        prefixes: [SINGLE_BIND_PREFIX],
+        prefixes: [SINGLE_BIND_PREFIX, CONSTANT_PREFIX],
         injectedParams: [],
         examples: [
             'nb-exec="this.counter++"',
@@ -313,7 +316,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-bound="this.myElement = element"',
             'nb-bound="element.classes.add(\'initialized\')"'
         ],
-        notes: 'The expression is always treated as single-bind, no need to specify — a leading `#`.'
+        notes: 'The expression is always treated as single-bind — no need to specify a leading `#`.'
     },
     {
         attribute: 'nb-container',
@@ -321,7 +324,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
         description: 'Renders a registered `@Container` (context-bound template region) inside this element. Use `@Name` for a direct reference, `%slotName` to bind to a route slot, or a plain expression for a dynamic name. Container-name lookup is case-insensitive. Pass inputs with `nb-in:prop` / `nb-in-ref:prop`.',
         expressionType: 'string (container name or route slot)',
         isPrefix: false,
-        prefixes: [CONSTANT_PREFIX, ROUTE_PREFIX],
+        prefixes: [SINGLE_BIND_PREFIX, CONSTANT_PREFIX, ROUTE_PREFIX],
         injectedParams: [],
         examples: [
             'nb-container="@MyContainer"',
@@ -329,7 +332,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-container="this.currentContainerName"  <!-- dynamic -->',
             '<div nb-container="@UserCard" nb-in:user="this.activeUser"></div>'
         ],
-        notes: 'Route-bound containers (`%slot`) update automatically when `Router.state[slot]` changes. An empty/unknown name hides the container.'
+        notes: 'Route-bound containers (`%slot`) update automatically when `Router.state[slot]` changes. An empty or unknown name disposes the current container and restores the element\'s original (fallback/projection) content — it does not hide the element.'
     },
     {
         attribute: 'nb-component',
@@ -384,14 +387,14 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
         expressionType: 'any',
         isPrefix: true,
         suffixDescription: 'The target property name on the child container/component. Kebab-cased names are converted to camelCase.',
-        prefixes: [SINGLE_BIND_PREFIX],
+        prefixes: [SINGLE_BIND_PREFIX, CONSTANT_PREFIX],
         injectedParams: [],
         examples: [
             'nb-in:data="this.parentData"',
             'nb-in:title="this.pageTitle"',
             'nb-in:user="this.activeUser"'
         ],
-        notes: 'The child does not sees the same object reference as the parent — mutations are isolated on both sides.'
+        notes: 'The child receives a deep clone (`structuredClone`), not the parent\'s object reference — mutations are isolated on both sides. Two delivery caveats: an input only updates when the bound expression produces a NEW, deep-unequal value — mutating the SAME object in place is never delivered to the child; and a value `structuredClone` cannot copy (functions, DOM nodes, class instances with non-cloneable state) fails delivery permanently — use `nb-in-ref` for such objects.'
     },
     {
         attribute: 'nb-in-ref',
@@ -400,7 +403,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
         expressionType: 'any',
         isPrefix: true,
         suffixDescription: 'The target property name on the child container/component. Kebab-cased names are converted to camelCase.',
-        prefixes: [SINGLE_BIND_PREFIX],
+        prefixes: [SINGLE_BIND_PREFIX, CONSTANT_PREFIX],
         injectedParams: [],
         examples: [
             'nb-in-ref:items="this.sharedList"',
@@ -442,7 +445,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
         attribute: 'nb-project-instead',
         displayName: 'Projection Slot (Replace)',
         description: 'Marks this element as a named projection target. When the parent renders, the entire element is replaced with the projected content (not just its children).',
-        expressionType: 'string (slot name)',
+        expressionType: 'string (slot name) or none for default',
         isPrefix: false,
         prefixes: [],
         injectedParams: [],
@@ -478,14 +481,16 @@ export function getHandlerInfo(attributeName: string): HandlerInfo | undefined {
     // Prefix lookup: nb-event:click → nb-event
     const colonIdx = attributeName.indexOf(':');
     if (colonIdx > 0) {
-        const base = attributeName.substring(0, colonIdx);
-        return registryMap.get(base);
+        const base = registryMap.get(attributeName.substring(0, colonIdx));
+        if (base) return base;
     }
 
-    // W3C mode: data-nb-value → nb-value
+    // W3C mode: data-nb-value → nb-value, data-nb-event--click → nb-event:click.
+    // The framework's W3C compliance mode flips the meta separator from ':'
+    // to '--' — without the conversion, every suffixed W3C attribute failed
+    // the lookup.
     if (attributeName.startsWith('data-')) {
-        const withoutData = attributeName.substring(5);
-        return getHandlerInfo(withoutData);
+        return getHandlerInfo(attributeName.substring(5).replace(/--/g, ':'));
     }
 
     return undefined;

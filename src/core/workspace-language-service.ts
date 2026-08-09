@@ -117,7 +117,11 @@ class LanguageServiceGroup {
         const k = normalizeKey(filePath);
         this.rootFiles.delete(k);
         this.fileContents.delete(k);
-        this.fileVersions.delete(k);
+        // Versions must stay monotonic per path — deleting the counter would
+        // restart a re-added file at version 1, and the shared
+        // DocumentRegistry could serve a stale AST for the same
+        // (fileName, version) pair after a delete/recreate with new content.
+        this.fileVersions.set(k, (this.fileVersions.get(k) ?? 0) + 1);
     }
 
     has(filePath: string): boolean {

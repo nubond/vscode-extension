@@ -264,6 +264,46 @@ describe('ts-plugin', () => {
         });
     });
 
+    // ---- Regression: per-project analysis state ----
+    // Before fix: a module-level `lastAnalysisVersion` was shared across all
+    // projects, so when project B reported the same version string as project
+    // A, B's initial analysis was silently skipped (and both shared — and
+    // clobbered — one analyzer).
+    describe('per-project state isolation', () => {
+        function makeLs(): any {
+            const ls: any = {};
+            for (const m of ['findRenameLocations', 'getProgram', 'getQuickInfoAtPosition']) ls[m] = jest.fn();
+            return ls;
+        }
+
+        function makeProject(version: string) {
+            return {
+                getLanguageService: jest.fn(() => ({ getProgram: () => undefined })),
+                getProjectVersion: () => version,
+                projectService: { getScriptInfo: jest.fn() },
+            } as any;
+        }
+
+        it('analyzes each project even when project versions collide', () => {
+            const projA = makeProject('v1');
+            const projB = makeProject('v1'); // same version string as A
+
+            pluginModule.create({
+                languageService: makeLs(), project: projA,
+                languageServiceHost: {} as any, serverHost: {} as any, config: {},
+            });
+            pluginModule.create({
+                languageService: makeLs(), project: projB,
+                languageServiceHost: {} as any, serverHost: {} as any, config: {},
+            });
+
+            // Project B must run its own initial analysis — with shared state
+            // it was skipped because A had already recorded version 'v1'.
+            expect(projA.getLanguageService).toHaveBeenCalled();
+            expect(projB.getLanguageService).toHaveBeenCalled();
+        });
+    });
+
     // ---- Catastrophic-failure isolation suite ----
     // The ts-plugin runs INSIDE tsserver. If our overrides throw uncaught,
     // tsserver may degrade or crash — disabling TypeScript IntelliSense for
@@ -383,5 +423,410 @@ describe('ts-plugin', () => {
             // we only replace methods on the *proxy*, not on tsserver's LS.
             expect(mockLS.findRenameLocations).toBe(originalRename);
         });
+    });
+});
+
+// ---- Round-2 regressions: HTML rename text-search hygiene ----
+
+describe('ts-plugin — HTML rename search (round 2)', () => {
+    const os = require('os');
+
+    /** A real on-disk project + a real LanguageService so refreshAnalysis
+     *  resolves the template association via the import. */
+    function setupRealProject(tsSource: string, htmlSource: string) {
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nubond-tsplugin-r2-')).replace(/\\/g, '/');
+        const tsPath = `${tmp}/container.ts`;
+        const htmlPath = `${tmp}/template.html`;
+        fs.writeFileSync(tsPath, tsSource, 'utf-8');
+        fs.writeFileSync(htmlPath, htmlSource, 'utf-8');
+
+        const host: any = {
+            getScriptFileNames: () => [tsPath],
+            getScriptVersion: () => '1',
+            getScriptSnapshot: (f: string) => {
+                const text = fs.existsSync(f) ? fs.readFileSync(f, 'utf-8') : undefined;
+                return text !== undefined ? ts.ScriptSnapshot.fromString(text) : undefined;
+            },
+            getCompilationSettings: () => ({
+                target: ts.ScriptTarget.ES2020,
+                module: ts.ModuleKind.CommonJS,
+                experimentalDecorators: true,
+                strict: false,
+                skipLibCheck: true,
+                noEmit: true,
+            }),
+            getDefaultLibFileName: (opts: any) => ts.getDefaultLibFilePath(opts),
+            fileExists: (f: string) => fs.existsSync(f),
+            readFile: (f: string) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf-8') : undefined),
+            getCurrentDirectory: () => tmp,
+            useCaseSensitiveFileNames: () => false,
+            getNewLine: () => '\n',
+        };
+        const realLs = ts.createLanguageService(host, ts.createDocumentRegistry());
+
+        const project = {
+            getLanguageService: () => realLs,
+            getProjectVersion: () => '1',
+            projectService: { getScriptInfo: jest.fn(() => null) },
+        } as any;
+
+        // The proxied LS only needs findRenameLocations for these tests.
+        const mockLS: any = { findRenameLocations: jest.fn(() => []) };
+        const info: ts.server.PluginCreateInfo = {
+            languageService: mockLS,
+            project,
+            languageServiceHost: {} as any,
+            serverHost: {} as any,
+            config: {},
+        };
+        const proxy = init({ typescript: ts }).create(info);
+        return { proxy, tsPath, htmlPath, tmp, realLs };
+    }
+
+    afterEach(() => {
+        // temp dirs are small; leave OS cleanup to the tmp reaper on failure
+    });
+
+    it('re-analyzes after a failed pass even though the project version is unchanged', () => {
+        // Regression: analyzeWithLanguageService used to return [] for BOTH
+        // "nothing changed" and "program unavailable" — the plugin stamped
+        // lastAnalysisVersion on the failed pass and served stale/empty
+        // association data until the next unrelated project change.
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nubond-tsplugin-l12-')).replace(/\\/g, '/');
+        const tsPath = `${tmp}/container.ts`;
+        const htmlPath = `${tmp}/template.html`;
+        const tsSource = [
+            "import html from './template.html';",
+            '@Container(html)',
+            'class C {',
+            '    counter = 0;',
+            '}',
+            '',
+        ].join('\n');
+        fs.writeFileSync(tsPath, tsSource, 'utf-8');
+        fs.writeFileSync(htmlPath, '<div nb-value="this.counter"></div>\n', 'utf-8');
+
+        const host: any = {
+            getScriptFileNames: () => [tsPath],
+            getScriptVersion: () => '1',
+            getScriptSnapshot: (f: string) => {
+                const text = fs.existsSync(f) ? fs.readFileSync(f, 'utf-8') : undefined;
+                return text !== undefined ? ts.ScriptSnapshot.fromString(text) : undefined;
+            },
+            getCompilationSettings: () => ({
+                target: ts.ScriptTarget.ES2020,
+                module: ts.ModuleKind.CommonJS,
+                experimentalDecorators: true,
+                strict: false,
+                skipLibCheck: true,
+                noEmit: true,
+            }),
+            getDefaultLibFileName: (opts: any) => ts.getDefaultLibFilePath(opts),
+            fileExists: (f: string) => fs.existsSync(f),
+            readFile: (f: string) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf-8') : undefined),
+            getCurrentDirectory: () => tmp,
+            useCaseSensitiveFileNames: () => false,
+            getNewLine: () => '\n',
+        };
+        const realLs = ts.createLanguageService(host, ts.createDocumentRegistry());
+        const notReadyLs: any = { getProgram: () => undefined };
+
+        let ready = false;
+        const project = {
+            getLanguageService: () => (ready ? realLs : notReadyLs),
+            getProjectVersion: () => 'stuck-1', // NEVER changes across calls
+            projectService: { getScriptInfo: jest.fn(() => null) },
+        } as any;
+
+        const mockLS: any = { findRenameLocations: jest.fn(() => []) };
+        const proxy = init({ typescript: ts }).create({
+            languageService: mockLS,
+            project,
+            languageServiceHost: {} as any,
+            serverHost: {} as any,
+            config: {},
+        } as ts.server.PluginCreateInfo);
+
+        // Program unavailable: the pass fails → no HTML locations yet.
+        const position = tsSource.indexOf('counter');
+        const first = (proxy.findRenameLocations(tsPath, position, false, false) ?? []) as ts.RenameLocation[];
+        expect(first.filter(l => l.fileName.endsWith('.html'))).toHaveLength(0);
+
+        // Program becomes available at the SAME project version. The failed
+        // pass must not have stamped it — this call has to re-analyze.
+        ready = true;
+        const second = (proxy.findRenameLocations(tsPath, position, false, false) ?? []) as ts.RenameLocation[];
+        expect(second.filter(l => l.fileName.endsWith('.html'))).toHaveLength(1);
+    });
+
+    // ---- Round 3 (M2): rename initiated at a USAGE site ----
+    // getMemberAtPosition only recognized the declaration identifier itself.
+    // Renaming `this.counter` from a method body updated all of TS but
+    // silently left every template on the old name.
+    it('folds in HTML refs when rename starts at a USAGE site, not the declaration', () => {
+        const tsSource = [
+            "import html from './template.html';",
+            '@Container(html)',
+            'class C {',
+            '    counter = 0;',
+            '    reset(): void {',
+            '        this.counter = 0;',
+            '    }',
+            '}',
+            '',
+        ].join('\n');
+        const htmlSource = '<div nb-value="this.counter"></div>\n';
+        const { proxy, tsPath } = setupRealProject(tsSource, htmlSource);
+
+        // Position on `counter` inside `this.counter = 0;` — the usage.
+        const position = tsSource.indexOf('this.counter = 0;') + 'this.'.length;
+        const result = proxy.findRenameLocations(tsPath, position, false, false) as ts.RenameLocation[];
+
+        expect(result).toBeDefined();
+        const htmlLocs = result.filter(l => l.fileName.endsWith('.html'));
+        expect(htmlLocs).toHaveLength(1);
+        expect(htmlLocs[0].textSpan.start).toBe(htmlSource.indexOf('counter'));
+        expect(htmlLocs[0].textSpan.length).toBe('counter'.length);
+    });
+
+    it('does not fold in HTML refs for a usage of a NON-member local variable', () => {
+        const tsSource = [
+            "import html from './template.html';",
+            '@Container(html)',
+            'class C {',
+            '    counter = 0;',
+            '    calc(): number {',
+            '        const local = 1;',
+            '        return local + 1;',
+            '    }',
+            '}',
+            '',
+        ].join('\n');
+        // HTML text that happens to contain 'local' must not be touched.
+        const htmlSource = '<div nb-value="this.local"></div>\n';
+        const { proxy, tsPath } = setupRealProject(tsSource, htmlSource);
+
+        const position = tsSource.indexOf('local + 1');
+        const result = proxy.findRenameLocations(tsPath, position, false, false);
+        // Mock native rename returned [] and no HTML refs may be added.
+        expect(result).toBeUndefined();
+    });
+
+    it('skips occurrences inside HTML comments and respects the left word boundary', () => {
+        const tsSource = [
+            "import html from './template.html';",
+            '@Container(html)',
+            'class C {',
+            '    counter = 0;',
+            '}',
+            '',
+        ].join('\n');
+        const htmlSource = [
+            '<!-- legacy: this.counter was renamed once -->',
+            '<div nb-value="this.counter"></div>',
+            '<span>_this.counter is not a reference</span>',
+            '',
+        ].join('\n');
+        const { proxy, tsPath, htmlPath } = setupRealProject(tsSource, htmlSource);
+
+        const position = tsSource.indexOf('counter');
+        const result = proxy.findRenameLocations(tsPath, position, false, false) as ts.RenameLocation[];
+
+        expect(result).toBeDefined();
+        const htmlLocs = result.filter(l => l.fileName.endsWith('.html'));
+        expect(htmlLocs).toHaveLength(1);
+        const expectedStart = htmlSource.indexOf('<div nb-value="this.counter') + '<div nb-value="this.'.length;
+        expect(htmlLocs[0].textSpan.start).toBe(expectedStart);
+        expect(htmlLocs[0].textSpan.length).toBe('counter'.length);
+        expect(htmlLocs[0].fileName.replace(/\\/g, '/')).toBe(htmlPath);
+    });
+
+    it('folds in HTML refs when renaming a PRIVATE constructor parameter property', () => {
+        const tsSource = [
+            "import html from './template.html';",
+            '@Container(html)',
+            'class C {',
+            '    constructor(private cd: ChangeDetector) {}',
+            '}',
+            '',
+        ].join('\n');
+        const htmlSource = '<div nb-event:click="this.cd.detect()"></div>\n';
+        const { proxy, tsPath } = setupRealProject(tsSource, htmlSource);
+
+        const position = tsSource.indexOf('cd:');
+        const result = proxy.findRenameLocations(tsPath, position, false, false) as ts.RenameLocation[];
+
+        expect(result).toBeDefined();
+        const htmlLocs = result.filter(l => l.fileName.endsWith('.html'));
+        expect(htmlLocs).toHaveLength(1);
+        expect(htmlLocs[0].textSpan.start).toBe(htmlSource.indexOf('cd.detect'));
+    });
+
+    it('does not treat a default-value identifier in a constructor param as a member', () => {
+        const tsSource = [
+            "import html from './template.html';",
+            "const FALLBACK = 'x';",
+            '@Container(html)',
+            'class C {',
+            '    constructor(public label = FALLBACK) {}',
+            '}',
+            '',
+        ].join('\n');
+        // HTML that happens to contain matching text — must NOT be touched
+        const htmlSource = '<div nb-value="this.FALLBACK"></div>\n';
+        const { proxy, tsPath } = setupRealProject(tsSource, htmlSource);
+
+        const position = tsSource.indexOf('FALLBACK) {}');
+        const result = proxy.findRenameLocations(tsPath, position, false, false);
+
+        // Original (mock) rename returned [] and no HTML refs may be added
+        expect(result).toBeUndefined();
+    });
+
+    // ---- Regression: raw text search rewrote non-binding text ----
+    // The scan now PARSES the template: prose, <script> content, and
+    // '@'-constant literals must never be renamed.
+    it('never rewrites prose, <script> content, or @ constant literals', () => {
+        const tsSource = [
+            "import html from './template.html';",
+            '@Container(html)',
+            'class C {',
+            '    counter = 0;',
+            '}',
+            '',
+        ].join('\n');
+        const htmlSource = [
+            '<p>docs mention this.counter in prose</p>',
+            '<script>if (this.counter) { console.log(this.counter); }</script>',
+            '<i nb-value="@this.counter is a literal"></i>',
+            '<div nb-value="this.counter"></div>',
+            '',
+        ].join('\n');
+        const { proxy, tsPath } = setupRealProject(tsSource, htmlSource);
+
+        const position = tsSource.indexOf('counter');
+        const result = proxy.findRenameLocations(tsPath, position, false, false) as ts.RenameLocation[];
+
+        expect(result).toBeDefined();
+        const htmlLocs = result.filter(l => l.fileName.endsWith('.html'));
+        // ONLY the evaluated nb-value binding — not prose (1×), script (2×),
+        // or the @ literal (1×).
+        expect(htmlLocs).toHaveLength(1);
+        const expectedStart = htmlSource.indexOf('<div nb-value="this.counter') + '<div nb-value="this.'.length;
+        expect(htmlLocs[0].textSpan.start).toBe(expectedStart);
+    });
+
+    // ---- Regression: disk-offset renames corrupted unsaved HTML buffers ----
+    // The extension reports dirty HTML files via configurePlugin; the plugin
+    // must OMIT them (fail-safe) instead of producing stale-offset edits.
+    it('omits rename locations for HTML files reported dirty via onConfigurationChanged', () => {
+        const tsSource = [
+            "import html from './template.html';",
+            '@Container(html)',
+            'class C {',
+            '    counter = 0;',
+            '}',
+            '',
+        ].join('\n');
+        const htmlSource = '<div nb-value="this.counter"></div>\n';
+        const { proxy, tsPath, htmlPath } = setupRealProject(tsSource, htmlSource);
+
+        const mod = init({ typescript: ts });
+        try {
+            // Report the template dirty — with a native-separator path to
+            // prove normalization (the analyzer stores forward slashes).
+            mod.onConfigurationChanged!({ dirtyHtmlFiles: [htmlPath.replace(/\//g, '\\').toUpperCase()] });
+
+            const position = tsSource.indexOf('counter');
+            const result = proxy.findRenameLocations(tsPath, position, false, false);
+            // Mock native rename returned [] and the only HTML ref was
+            // suppressed → nothing at all.
+            expect(result).toBeUndefined();
+        } finally {
+            // Reset module-level state for the remaining tests.
+            mod.onConfigurationChanged!({ dirtyHtmlFiles: [] });
+        }
+
+        // Once the file is clean again, the location comes back.
+        const position = tsSource.indexOf('counter');
+        const result = proxy.findRenameLocations(tsPath, position, false, false) as ts.RenameLocation[];
+        expect(result).toBeDefined();
+        expect(result.filter(l => l.fileName.endsWith('.html'))).toHaveLength(1);
+    });
+
+    // ---- Regression: renaming a member declared on an UNDECORATED base
+    // class skipped HTML entirely (the old gate required the declaring class
+    // itself to be an association), leaving subclass templates broken.
+    it('folds in subclass template refs when renaming a base-class member', () => {
+        const os2 = require('os');
+        const tmp = fs.mkdtempSync(path.join(os2.tmpdir(), 'nubond-tsplugin-m4-')).replace(/\\/g, '/');
+        const basePath = `${tmp}/base.ts`;
+        const aPath = `${tmp}/a.ts`;
+        const bPath = `${tmp}/b.ts`;
+        fs.writeFileSync(basePath, `export class BaseCard { title: string = ''; }`, 'utf-8');
+        fs.writeFileSync(aPath, [
+            "import html from './a.html';",
+            "import { BaseCard } from './base';",
+            '@Container(html)',
+            'class CardA extends BaseCard {}',
+        ].join('\n'), 'utf-8');
+        fs.writeFileSync(bPath, [
+            "import html from './b.html';",
+            "import { BaseCard } from './base';",
+            '@Container(html)',
+            'class CardB extends BaseCard {}',
+        ].join('\n'), 'utf-8');
+        fs.writeFileSync(`${tmp}/a.html`, '<div nb-value="this.title"></div>', 'utf-8');
+        fs.writeFileSync(`${tmp}/b.html`, '<span nb-value="this.title"></span>', 'utf-8');
+
+        const rootFiles = [basePath, aPath, bPath];
+        const host: any = {
+            getScriptFileNames: () => rootFiles,
+            getScriptVersion: () => '1',
+            getScriptSnapshot: (f: string) => {
+                const text = fs.existsSync(f) ? fs.readFileSync(f, 'utf-8') : undefined;
+                return text !== undefined ? ts.ScriptSnapshot.fromString(text) : undefined;
+            },
+            getCompilationSettings: () => ({
+                target: ts.ScriptTarget.ES2020,
+                module: ts.ModuleKind.CommonJS,
+                experimentalDecorators: true,
+                strict: false,
+                skipLibCheck: true,
+                noEmit: true,
+            }),
+            getDefaultLibFileName: (opts: any) => ts.getDefaultLibFilePath(opts),
+            fileExists: (f: string) => fs.existsSync(f),
+            readFile: (f: string) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf-8') : undefined),
+            getCurrentDirectory: () => tmp,
+            useCaseSensitiveFileNames: () => false,
+            getNewLine: () => '\n',
+        };
+        const realLs = ts.createLanguageService(host, ts.createDocumentRegistry());
+        const project = {
+            getLanguageService: () => realLs,
+            getProjectVersion: () => '1',
+            projectService: { getScriptInfo: jest.fn(() => null) },
+        } as any;
+        const mockLS: any = { findRenameLocations: jest.fn(() => []) };
+        const proxy = init({ typescript: ts }).create({
+            languageService: mockLS,
+            project,
+            languageServiceHost: {} as any,
+            serverHost: {} as any,
+            config: {},
+        });
+
+        const baseSource = fs.readFileSync(basePath, 'utf-8');
+        const position = baseSource.indexOf('title');
+        const result = proxy.findRenameLocations(basePath, position, false, false) as ts.RenameLocation[];
+
+        expect(result).toBeDefined();
+        const htmlFiles = result
+            .filter(l => l.fileName.endsWith('.html'))
+            .map(l => l.fileName.replace(/\\/g, '/').toLowerCase());
+        // BOTH subclasses' templates fold in
+        expect(htmlFiles.some(f => f.endsWith('a.html'))).toBe(true);
+        expect(htmlFiles.some(f => f.endsWith('b.html'))).toBe(true);
     });
 });

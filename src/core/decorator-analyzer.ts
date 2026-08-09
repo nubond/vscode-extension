@@ -21,6 +21,13 @@ export interface ClassMember {
     offset: number;
     /** Whether the member is public (accessible from templates) */
     isPublic: boolean;
+    /**
+     * Absolute (slash-normalized) path of the file that declares this member,
+     * set only for members inherited from a base class declared elsewhere.
+     * Undefined for members declared directly on the associated class —
+     * consumers fall back to the association's `tsFilePath`.
+     */
+    declaredIn?: string;
 }
 
 export interface TemplateAssociation {
@@ -43,12 +50,21 @@ export interface TemplateAssociation {
 }
 
 export interface RegisteredEntity {
+    /**
+     * The name the framework registers the entity under at runtime — what
+     * templates actually reference. Mirrors `Environment.add*` semantics:
+     * containers register the custom name / class name verbatim; components
+     * and aspects kebab-case names without a '-'; transformers camelCase.
+     */
     name: string;
     type: 'container' | 'component' | 'aspect' | 'transformer' | 'template' | 'injectable';
     tsFilePath: string;
     className: string;
     /** For transformers: the function name used in expressions (e.g. 'localize' for class Localize) */
     transformerFunctionName?: string;
+    /** Position of the declaration (class, or `$Template(...)` call) for navigation */
+    line?: number;
+    character?: number;
 }
 
 export class DecoratorAnalyzer {
@@ -58,8 +74,13 @@ export class DecoratorAnalyzer {
     private tsToAssociations = new Map<string, TemplateAssociation[]>();
     /** All registered entities (containers, components, aspects, transformers) */
     private registeredEntities: RegisteredEntity[] = [];
-    /** Index of all interface/type/class definitions found in source files: name → filePath */
-    private typeIndex = new Map<string, string>();
+    /**
+     * Index of all interface/type/class definitions found in source files:
+     * name → file paths declaring a type of that name. Multiple files can
+     * declare same-named types; lookups scan each candidate until the
+     * declaration is actually found instead of last-write-wins.
+     */
+    private typeIndex = new Map<string, string[]>();
     /**
      * Cache of parsed `ts.SourceFile`s keyed by normalized path. Hover, completion
      * and definition each call findMemberInType / findMemberWithType / etc.
@@ -69,15 +90,58 @@ export class DecoratorAnalyzer {
      */
     private sourceFileCache = new Map<string, ts.SourceFile>();
     /**
-     * Last-seen `ts.SourceFile` reference per analyzed TS file path. Used by
-     * `analyzeWithLanguageService` to detect which files actually changed
-     * between two `ls.getProgram()` calls — TypeScript's LanguageService
-     * returns the *same* `SourceFile` object for unchanged files, so a simple
-     * reference check is enough to skip re-analysis. This is the foundation
-     * of the incremental, type-checked update path that replaces the
-     * `analyzeSourceText` fallback (which lost inferred types on every edit).
+     * Last-seen `ts.SourceFile` reference per analyzed TS file path, tracked
+     * PER LanguageService. Used by `analyzeWithLanguageService` to detect
+     * which files actually changed between two `ls.getProgram()` calls —
+     * TypeScript's LanguageService returns the *same* `SourceFile` object for
+     * unchanged files, so a simple reference check is enough to skip
+     * re-analysis. Per-service tracking matters: different services hold
+     * different `SourceFile` objects for the same shared file, so a single
+     * global map made every shared file fail the identity check on each
+     * alternating service's pass — permanent re-analysis ping-pong.
+     *
+     * `analyzedAt` records the analysis tick, so a file can also be
+     * invalidated when one of its DECLARATION DEPENDENCIES changes (see
+     * `declChangeTicks`) even though its own SourceFile identity is stable.
      */
-    private lastAnalyzedSourceFiles = new Map<string, ts.SourceFile>();
+    private lastAnalyzedByService = new WeakMap<ts.LanguageService, Map<string, AnalyzedFileRecord>>();
+    /**
+     * Monotonic counter, bumped once per `analyzeWithLanguageService` pass.
+     * Global across services so cross-service staleness comparisons work.
+     */
+    private analysisTick = 0;
+    /**
+     * Tick at which each file's own text last changed (SourceFile identity
+     * check failed), keyed by normalized path. Association member records
+     * carry cross-file coordinates: a subclass's inherited members store
+     * name offsets/lines INSIDE the base file, captured when the SUBCLASS
+     * was analyzed. Editing the base file moves those declarations, but the
+     * subclass's SourceFile is unchanged so the identity check alone would
+     * keep its stale coordinates forever — rename fan-out
+     * (`getAssociationsWithMember`, offset-keyed) then silently missed
+     * subclass templates, and the TS-rename delegation fired at stale
+     * positions. Files whose members reference a declaring file with a newer
+     * change tick than their own `analyzedAt` are re-analyzed.
+     */
+    private declChangeTicks = new Map<string, number>();
+    /**
+     * Per-LanguageService record of which files each service's program
+     * contained on its previous `analyzeWithLanguageService` call. The
+     * stale-file cleanup must compare against *this service's* previous
+     * snapshot only — comparing against the global `lastAnalyzedSourceFiles`
+     * wiped every other tsconfig group's analysis on each call (multi-project
+     * workspaces ended up with only the most recently analyzed group alive).
+     */
+    private lastSeenByService = new WeakMap<ts.LanguageService, Set<string>>();
+    /**
+     * How many LanguageServices' programs currently contain each analyzed
+     * file. Programs include *transitive imports*, so one file can appear in
+     * several groups' programs at once (e.g. a shared util imported across
+     * tsconfig projects). A file is only evicted when its LAST claimant drops
+     * it — otherwise one group dropping an import would wipe analysis still
+     * valid for another group.
+     */
+    private fileClaimCounts = new Map<string, number>();
 
     /**
      * Analyze a set of TypeScript files and build the association maps.
@@ -132,10 +196,14 @@ export class DecoratorAnalyzer {
      * `analyzeSourceText` regression where edits silently downgraded all
      * inferred member types to `any`.
      *
-     * Returns the list of file paths that were re-analyzed. Empty result on
-     * a no-op call (LanguageService not ready yet, or nothing changed).
+     * Returns the list of file paths that were re-analyzed — empty on a
+     * legitimate no-op call (nothing changed). Returns `undefined` when the
+     * analysis could not run at all (LanguageService not ready, program or
+     * checker unavailable): callers tracking a "last analyzed version" stamp
+     * must NOT bump it in that case, or the failed pass would suppress
+     * re-analysis until the next unrelated project change.
      */
-    analyzeWithLanguageService(languageService: ts.LanguageService): string[] {
+    analyzeWithLanguageService(languageService: ts.LanguageService): string[] | undefined {
         // The LanguageService itself can throw — e.g. tsserver in a bad state,
         // a corrupt tsconfig that fails type-resolution, or an unsupported
         // syntax flag. A crash here would propagate up to whatever called us
@@ -147,16 +215,16 @@ export class DecoratorAnalyzer {
             program = languageService.getProgram();
         } catch (err) {
             logError('analyzeWithLanguageService.getProgram', err);
-            return [];
+            return undefined;
         }
-        if (!program) return [];
+        if (!program) return undefined;
 
         let checker: ts.TypeChecker;
         try {
             checker = program.getTypeChecker();
         } catch (err) {
             logError('analyzeWithLanguageService.getTypeChecker', err);
-            return [];
+            return undefined;
         }
 
         const reanalyzed: string[] = [];
@@ -167,20 +235,57 @@ export class DecoratorAnalyzer {
             sourceFiles = program.getSourceFiles();
         } catch (err) {
             logError('analyzeWithLanguageService.getSourceFiles', err);
-            return [];
+            return undefined;
         }
 
+        let lastAnalyzed = this.lastAnalyzedByService.get(languageService);
+        if (!lastAnalyzed) {
+            lastAnalyzed = new Map<string, AnalyzedFileRecord>();
+            this.lastAnalyzedByService.set(languageService, lastAnalyzed);
+        }
+
+        const tick = ++this.analysisTick;
+
+        // Phase 1: identity check. Files whose SourceFile reference changed
+        // were re-parsed by the LanguageService — their own declarations may
+        // have moved, so record the change tick BEFORE deciding dependents.
+        const toAnalyze: ts.SourceFile[] = [];
+        const changedKeys = new Set<string>();
+        const eligible: ts.SourceFile[] = [];
         for (const sourceFile of sourceFiles) {
             if (sourceFile.isDeclarationFile) continue;
             if (sourceFile.fileName.includes('node_modules')) continue;
+            eligible.push(sourceFile);
 
             const key = normalizePath(sourceFile.fileName);
             seen.add(key);
 
-            // Skip files whose SourceFile reference hasn't changed — the
-            // LanguageService didn't re-parse them, so our analysis is fresh.
-            const prev = this.lastAnalyzedSourceFiles.get(key);
-            if (prev === sourceFile) continue;
+            const prev = lastAnalyzed.get(key);
+            if (prev?.sourceFile === sourceFile) continue;
+
+            toAnalyze.push(sourceFile);
+            changedKeys.add(key);
+            this.declChangeTicks.set(key, tick);
+        }
+
+        // Phase 2: dependent invalidation. An unchanged file whose association
+        // members reference a declaring file (`declaredIn`) that changed after
+        // this file was last analyzed holds stale cross-file coordinates —
+        // re-analyze it too. Must run against the PRE-analysis association
+        // maps (phase 3 rebuilds them).
+        for (const sourceFile of eligible) {
+            const key = normalizePath(sourceFile.fileName);
+            if (changedKeys.has(key)) continue;
+            const prev = lastAnalyzed.get(key);
+            if (!prev) continue; // no entry ⇒ phase 1 already queued it
+            if (this.hasStaleDeclarationDependency(key, prev.analyzedAt)) {
+                toAnalyze.push(sourceFile);
+            }
+        }
+
+        // Phase 3: (re)analyze everything queued.
+        for (const sourceFile of toAnalyze) {
+            const key = normalizePath(sourceFile.fileName);
 
             // Per-file try/catch: a single broken source file (e.g. one that
             // hits a bug in `extractMembers`) must not stop us analyzing the
@@ -188,7 +293,7 @@ export class DecoratorAnalyzer {
             // cripple every provider for every other file.
             try {
                 this.removeFile(sourceFile.fileName);
-                this.lastAnalyzedSourceFiles.set(key, sourceFile);
+                lastAnalyzed.set(key, { sourceFile, analyzedAt: tick });
                 this.analyzeSourceFile(sourceFile, checker);
                 reanalyzed.push(sourceFile.fileName);
             } catch (err) {
@@ -199,21 +304,50 @@ export class DecoratorAnalyzer {
             }
         }
 
-        // Detect files removed since the last call — they're no longer in the
-        // program's SourceFile list. Drop their analyzer state too, otherwise
-        // we'd accumulate stale associations across deletes.
-        for (const [key, _sf] of this.lastAnalyzedSourceFiles) {
-            if (!seen.has(key)) {
-                try {
-                    this.removeFile(key);
-                } catch (err) {
-                    // removeFile is internal — a throw here would indicate
-                    // map corruption, which is worth flagging.
-                    logError(`analyzeWithLanguageService.removeStaleFile(${key})`, err);
-                }
-                this.lastAnalyzedSourceFiles.delete(key);
+        // Detect files removed since THIS service's last call — they're no
+        // longer in its program's SourceFile list. Scoped per LanguageService:
+        // other tsconfig groups' files are legitimately absent from this
+        // program and must not be evicted.
+        const prevSeen = this.lastSeenByService.get(languageService);
+
+        // Claim files this service's program contains for the first time.
+        for (const key of seen) {
+            if (!prevSeen || !prevSeen.has(key)) {
+                this.fileClaimCounts.set(key, (this.fileClaimCounts.get(key) ?? 0) + 1);
             }
         }
+
+        if (prevSeen) {
+            for (const key of prevSeen) {
+                if (!seen.has(key)) {
+                    // Release this service's claim; evict only when no other
+                    // service's program still contains the file.
+                    const remaining = (this.fileClaimCounts.get(key) ?? 1) - 1;
+                    if (remaining > 0) {
+                        this.fileClaimCounts.set(key, remaining);
+                        continue;
+                    }
+                    this.fileClaimCounts.delete(key);
+                    try {
+                        this.removeFile(key);
+                    } catch (err) {
+                        // removeFile is internal — a throw here would indicate
+                        // map corruption, which is worth flagging.
+                        logError(`analyzeWithLanguageService.removeStaleFile(${key})`, err);
+                    }
+                    lastAnalyzed.delete(key);
+                    // No claimant left ⇒ no service can need this file's
+                    // change tick for dependent invalidation anymore — prune
+                    // it so the map doesn't grow with deleted/renamed files.
+                    // Deliberately NOT done inside removeFile: phase 3 calls
+                    // removeFile right after phase 1 recorded the tick, and
+                    // deleting it there would break cross-service dependent
+                    // invalidation.
+                    this.declChangeTicks.delete(key);
+                }
+            }
+        }
+        this.lastSeenByService.set(languageService, seen);
 
         return reanalyzed;
     }
@@ -261,6 +395,38 @@ export class DecoratorAnalyzer {
     }
 
     /**
+     * All associations whose member list contains a member backed by the SAME
+     * declaration — matched by name + declaring file + name-start offset.
+     *
+     * This is how rename / references / the ts-plugin fan out to every class
+     * that shares a member: a base-class property appears (via
+     * `collectInheritedMembers`, with `declaredIn` set) in the member list of
+     * every subclass association, all pointing at one declaration. Fanning
+     * out by declaration keeps sibling subclasses' templates in sync on
+     * rename — previously only the originating class's templates were edited
+     * and the rest silently broke at runtime.
+     *
+     * The offset key is only trustworthy because `analyzeWithLanguageService`
+     * re-analyzes dependents when a declaring file changes (`declChangeTicks`)
+     * — without that, a base-file edit left subclass records pointing at the
+     * old offset and this lookup silently returned nothing.
+     */
+    getAssociationsWithMember(memberName: string, declFilePath: string, declOffset: number): TemplateAssociation[] {
+        const declNorm = normalizePath(declFilePath);
+        const result: TemplateAssociation[] = [];
+        for (const assocs of this.tsToAssociations.values()) {
+            for (const assoc of assocs) {
+                const matches = assoc.members.some(m =>
+                    m.name === memberName &&
+                    m.offset === declOffset &&
+                    normalizePath(m.declaredIn ?? assoc.tsFilePath) === declNorm);
+                if (matches) result.push(assoc);
+            }
+        }
+        return result;
+    }
+
+    /**
      * Get all registered entities of a specific type.
      */
     getEntitiesByType(type: RegisteredEntity['type']): RegisteredEntity[] {
@@ -292,38 +458,56 @@ export class DecoratorAnalyzer {
         // Strip generic params, array brackets, and union suffixes for lookup
         const cleanType = typeName.replace(/<.*>/, '').replace(/\[\]$/, '').replace(/\s*\|.*$/, '').trim();
 
-        // Find entity with matching class name, or fall back to type index
+        // Same-named types can exist in multiple files — scan each candidate
+        // until the declaration actually containing the member is found.
+        for (const filePath of this.candidateFilesForType(cleanType)) {
+            const sourceFile = this.getSourceFile(filePath);
+            if (!sourceFile) continue;
+
+            // Find the class/interface/type-alias and the member
+            let result: { filePath: string; line: number; character: number } | undefined;
+            ts.forEachChild(sourceFile, (node) => {
+                if (result) return;
+                if (ts.isClassDeclaration(node) && node.name?.text === cleanType) {
+                    for (const member of node.members) {
+                        if (member.name && member.name.getText(sourceFile) === memberName) {
+                            const pos = sourceFile.getLineAndCharacterOfPosition(member.name.getStart(sourceFile));
+                            result = { filePath, line: pos.line, character: pos.character };
+                            return;
+                        }
+                    }
+                } else {
+                    const shapeMembers = getObjectShapeMembers(node, cleanType);
+                    if (shapeMembers) {
+                        for (const member of shapeMembers) {
+                            if (member.name && member.name.getText(sourceFile) === memberName) {
+                                const pos = sourceFile.getLineAndCharacterOfPosition(member.name.getStart(sourceFile));
+                                result = { filePath, line: pos.line, character: pos.character };
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+
+            if (result) return result;
+        }
+
+        return undefined;
+    }
+
+    /**
+     * All files that may declare a type of the given name: a registered
+     * entity's file first (most specific), then every typeIndex candidate.
+     */
+    private candidateFilesForType(cleanType: string): string[] {
+        const candidates: string[] = [];
         const entity = this.registeredEntities.find(e => e.className === cleanType);
-        const filePath = entity?.tsFilePath ?? this.typeIndex.get(cleanType);
-        if (!filePath) return undefined;
-
-        const sourceFile = this.getSourceFile(filePath);
-        if (!sourceFile) return undefined;
-
-        // Find the class/interface and the member
-        let result: { filePath: string; line: number; character: number } | undefined;
-        ts.forEachChild(sourceFile, (node) => {
-            if (result) return;
-            if (ts.isClassDeclaration(node) && node.name?.text === cleanType) {
-                for (const member of node.members) {
-                    if (member.name && member.name.getText(sourceFile) === memberName) {
-                        const pos = sourceFile.getLineAndCharacterOfPosition(member.name.getStart(sourceFile));
-                        result = { filePath, line: pos.line, character: pos.character };
-                        return;
-                    }
-                }
-            } else if (ts.isInterfaceDeclaration(node) && node.name.text === cleanType) {
-                for (const member of node.members) {
-                    if (member.name && member.name.getText(sourceFile) === memberName) {
-                        const pos = sourceFile.getLineAndCharacterOfPosition(member.name.getStart(sourceFile));
-                        result = { filePath, line: pos.line, character: pos.character };
-                        return;
-                    }
-                }
-            }
-        });
-
-        return result;
+        if (entity) candidates.push(entity.tsFilePath);
+        for (const fp of this.typeIndex.get(cleanType) ?? []) {
+            if (!candidates.includes(fp)) candidates.push(fp);
+        }
+        return candidates;
     }
 
     /**
@@ -334,11 +518,14 @@ export class DecoratorAnalyzer {
     findMemberWithType(typeName: string, memberName: string): { filePath: string; line: number; character: number; type: string; kind: string } | undefined {
         const cleanType = typeName.replace(/<.*>/, '').replace(/\[\]$/, '').replace(/\s*\|.*$/, '').trim();
 
-        // Resolve the file path: check registered entities first, then type index
-        const entity = this.registeredEntities.find(e => e.className === cleanType);
-        const filePath = entity?.tsFilePath ?? this.typeIndex.get(cleanType);
-        if (!filePath) return undefined;
+        for (const filePath of this.candidateFilesForType(cleanType)) {
+            const found = this.findMemberWithTypeInFile(filePath, cleanType, memberName);
+            if (found) return found;
+        }
+        return undefined;
+    }
 
+    private findMemberWithTypeInFile(filePath: string, cleanType: string, memberName: string): { filePath: string; line: number; character: number; type: string; kind: string } | undefined {
         const sourceFile = this.getSourceFile(filePath);
         if (!sourceFile) return undefined;
 
@@ -370,18 +557,14 @@ export class DecoratorAnalyzer {
                         return;
                     }
                 }
-                // Check constructor params with visibility modifiers
+                // Check constructor parameter properties
                 for (const member of node.members) {
                     if (result) return;
                     if (ts.isConstructorDeclaration(member)) {
                         for (const param of member.parameters) {
                             const paramMods = ts.getModifiers(param);
                             if (!paramMods) continue;
-                            const hasVisibility = paramMods.some(m =>
-                                m.kind === ts.SyntaxKind.PublicKeyword ||
-                                m.kind === ts.SyntaxKind.ProtectedKeyword
-                            );
-                            if (!hasVisibility) continue;
+                            if (!isParameterProperty(paramMods)) continue;
                             if (!param.name || !ts.isIdentifier(param.name)) continue;
                             if (param.name.text === memberName) {
                                 const pos = sourceFile.getLineAndCharacterOfPosition(param.name.getStart(sourceFile));
@@ -393,8 +576,10 @@ export class DecoratorAnalyzer {
                         }
                     }
                 }
-            } else if (ts.isInterfaceDeclaration(node) && node.name.text === cleanType) {
-                for (const member of node.members) {
+            } else {
+                const shapeMembers = getObjectShapeMembers(node, cleanType);
+                if (!shapeMembers) return;
+                for (const member of shapeMembers) {
                     if (!member.name) continue;
                     const nameText = member.name.getText(sourceFile);
                     if (nameText !== memberName) continue;
@@ -434,34 +619,42 @@ export class DecoratorAnalyzer {
             }
         }
 
-        // Look up in the type index
-        const filePath = this.typeIndex.get(cleanType);
-        if (!filePath) return undefined;
+        // Look up in the type index — scan each candidate file until the
+        // declaration is found (same-named types can live in multiple files).
+        for (const filePath of this.typeIndex.get(cleanType) ?? []) {
+            const members = this.getTypeMembersInFile(filePath, cleanType);
+            if (members) return members;
+        }
+        return undefined;
+    }
 
+    private getTypeMembersInFile(filePath: string, cleanType: string): ClassMember[] | undefined {
         const sourceFile = this.getSourceFile(filePath);
         if (!sourceFile) return undefined;
         const members: ClassMember[] = [];
 
         ts.forEachChild(sourceFile, (node) => {
             if (members.length > 0) return; // already found
-            if (ts.isInterfaceDeclaration(node) && node.name.text === cleanType) {
-                for (const member of node.members) {
-                    if (ts.isPropertySignature(member) && member.name) {
-                        const nameText = member.name.getText(sourceFile);
-                        const pos = sourceFile.getLineAndCharacterOfPosition(member.name.getStart(sourceFile));
-                        let type = 'any';
-                        if (member.type) type = member.type.getText(sourceFile);
-                        members.push({ name: nameText, kind: 'property', type, line: pos.line, character: pos.character, offset: member.getStart(), isPublic: true });
-                    } else if (ts.isMethodSignature(member) && member.name) {
-                        const nameText = member.name.getText(sourceFile);
-                        const pos = sourceFile.getLineAndCharacterOfPosition(member.name.getStart(sourceFile));
-                        let type = 'any';
-                        if (member.type) type = member.type.getText(sourceFile);
-                        members.push({ name: nameText, kind: 'method', type, line: pos.line, character: pos.character, offset: member.getStart(), isPublic: true });
-                    }
-                }
-            } else if (ts.isClassDeclaration(node) && node.name?.text === cleanType) {
+            if (ts.isClassDeclaration(node) && node.name?.text === cleanType) {
                 members.push(...this.extractMembers(node, sourceFile));
+                return;
+            }
+            const shapeMembers = getObjectShapeMembers(node, cleanType);
+            if (!shapeMembers) return;
+            for (const member of shapeMembers) {
+                if (ts.isPropertySignature(member) && member.name) {
+                    const nameText = member.name.getText(sourceFile);
+                    const pos = sourceFile.getLineAndCharacterOfPosition(member.name.getStart(sourceFile));
+                    let type = 'any';
+                    if (member.type) type = member.type.getText(sourceFile);
+                    members.push({ name: nameText, kind: 'property', type, line: pos.line, character: pos.character, offset: member.getStart(), isPublic: true });
+                } else if (ts.isMethodSignature(member) && member.name) {
+                    const nameText = member.name.getText(sourceFile);
+                    const pos = sourceFile.getLineAndCharacterOfPosition(member.name.getStart(sourceFile));
+                    let type = 'any';
+                    if (member.type) type = member.type.getText(sourceFile);
+                    members.push({ name: nameText, kind: 'method', type, line: pos.line, character: pos.character, offset: member.getStart(), isPublic: true });
+                }
             }
         });
 
@@ -506,8 +699,13 @@ export class DecoratorAnalyzer {
         this.tsToAssociations.clear();
         this.registeredEntities = [];
         this.typeIndex.clear();
+        // WeakMaps have no clear(); dropping the references resets all
+        // per-LanguageService snapshots in one go.
         this.sourceFileCache.clear();
-        this.lastAnalyzedSourceFiles.clear();
+        this.lastAnalyzedByService = new WeakMap();
+        this.lastSeenByService = new WeakMap();
+        this.fileClaimCounts.clear();
+        this.declChangeTicks.clear();
     }
 
     /**
@@ -542,13 +740,26 @@ export class DecoratorAnalyzer {
         // Normalize both sides to handle Windows path case differences between
         // paths from ts.createProgram (via analyzeFiles) and paths from uri.fsPath.
         const typeKeysToDelete: string[] = [];
-        for (const [typeName, filePath] of this.typeIndex) {
-            if (normalizePath(filePath) === normalized) {
+        for (const [typeName, filePaths] of this.typeIndex) {
+            const remaining = filePaths.filter(fp => normalizePath(fp) !== normalized);
+            if (remaining.length === 0) {
                 typeKeysToDelete.push(typeName);
+            } else if (remaining.length !== filePaths.length) {
+                this.typeIndex.set(typeName, remaining);
             }
         }
         for (const key of typeKeysToDelete) {
             this.typeIndex.delete(key);
+        }
+    }
+
+    /** Record that `filePath` declares a type named `typeName` (multimap add). */
+    private addToTypeIndex(typeName: string, filePath: string): void {
+        const existing = this.typeIndex.get(typeName);
+        if (!existing) {
+            this.typeIndex.set(typeName, [filePath]);
+        } else if (!existing.includes(filePath)) {
+            existing.push(filePath);
         }
     }
 
@@ -576,13 +787,21 @@ export class DecoratorAnalyzer {
     private analyzeSourceFile(sourceFile: ts.SourceFile, checker: ts.TypeChecker): void {
         const filePath = normalizeSlashes(sourceFile.fileName);
 
+        // Clear any previous analysis of this file first (idempotent — the
+        // analyzeWithLanguageService path already did it). Without this, the
+        // analyzeFiles/analyzeProgram path DUPLICATED associations and
+        // entities: a second analyzeFiles call, or a file reachable from two
+        // groups' programs (shared transitive import), registered everything
+        // twice.
+        this.removeFile(filePath);
+
         // Prime the cache with the program's parsed source so callers like
         // findMemberInType / getTypeMembers don't re-read+re-parse from disk.
         this.sourceFileCache.set(normalizePath(filePath), sourceFile);
 
         ts.forEachChild(sourceFile, (node) => {
             if (ts.isClassDeclaration(node) && node.name) {
-                this.typeIndex.set(node.name.text, filePath);
+                this.addToTypeIndex(node.name.text, filePath);
                 const decorators = this.getDecorators(node);
                 for (const dec of decorators) {
                     const association = this.processDecoratorCore(dec, node, sourceFile, filePath, checker);
@@ -591,11 +810,13 @@ export class DecoratorAnalyzer {
                     }
                 }
             } else if (ts.isInterfaceDeclaration(node) && node.name) {
-                this.typeIndex.set(node.name.text, filePath);
+                this.addToTypeIndex(node.name.text, filePath);
             } else if (ts.isTypeAliasDeclaration(node) && node.name) {
-                this.typeIndex.set(node.name.text, filePath);
+                this.addToTypeIndex(node.name.text, filePath);
             }
         });
+
+        this.scanForTemplateRegistrations(sourceFile, filePath);
     }
 
     /**
@@ -613,7 +834,7 @@ export class DecoratorAnalyzer {
 
         ts.forEachChild(sourceFile, (node) => {
             if (ts.isClassDeclaration(node) && node.name) {
-                this.typeIndex.set(node.name.text, filePath);
+                this.addToTypeIndex(node.name.text, filePath);
                 const decorators = this.getDecorators(node);
                 for (const dec of decorators) {
                     const association = this.processDecoratorCore(dec, node, sourceFile, filePath);
@@ -622,11 +843,44 @@ export class DecoratorAnalyzer {
                     }
                 }
             } else if (ts.isInterfaceDeclaration(node) && node.name) {
-                this.typeIndex.set(node.name.text, filePath);
+                this.addToTypeIndex(node.name.text, filePath);
             } else if (ts.isTypeAliasDeclaration(node) && node.name) {
-                this.typeIndex.set(node.name.text, filePath);
+                this.addToTypeIndex(node.name.text, filePath);
             }
         });
+
+        this.scanForTemplateRegistrations(sourceFile, filePath);
+    }
+
+    /**
+     * Register `$Template('name', …)` calls as 'template' entities so
+     * `nb-template="@name"` completion and navigation resolve global template
+     * names. Previously nothing ever produced 'template' entities, so both
+     * features were dead. Calls may appear at module scope or nested inside
+     * decorator metadata arrays — walk the whole file.
+     */
+    private scanForTemplateRegistrations(sourceFile: ts.SourceFile, filePath: string): void {
+        const visit = (node: ts.Node): void => {
+            if (ts.isCallExpression(node) &&
+                ts.isIdentifier(node.expression) &&
+                node.expression.text === '$Template' &&
+                node.arguments.length >= 1) {
+                const nameArg = node.arguments[0];
+                if (ts.isStringLiteral(nameArg) || ts.isNoSubstitutionTemplateLiteral(nameArg)) {
+                    const pos = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+                    this.registeredEntities.push({
+                        name: nameArg.text,
+                        type: 'template',
+                        tsFilePath: filePath,
+                        className: nameArg.text,
+                        line: pos.line,
+                        character: pos.character,
+                    });
+                }
+            }
+            ts.forEachChild(node, visit);
+        };
+        visit(sourceFile);
     }
 
     private getDecorators(node: ts.ClassDeclaration): ts.Decorator[] {
@@ -656,29 +910,30 @@ export class DecoratorAnalyzer {
         const templateDecorators = ['Container', 'Component', 'AppRoot'];
         const entityDecorators = ['Aspect', 'Transformer', 'Injectable'];
 
-        if (templateDecorators.includes(decoratorName) || entityDecorators.includes(decoratorName)) {
+        // @AppRoot is deliberately excluded: the runtime's AppRoot decorator
+        // only calls Environment.setupRouter + Environment.addApp — it never
+        // registers the class as a container, so offering it for
+        // nb-container="@…" completion/navigation blessed a name that can
+        // never resolve at runtime. (The template ASSOCIATION below still
+        // covers AppRoot for member/template features.)
+        if ((templateDecorators.includes(decoratorName) && decoratorName !== 'AppRoot') || entityDecorators.includes(decoratorName)) {
             const className = classNode.name?.text ?? 'Anonymous';
+            const customName = this.extractCustomEntityName(decoratorExpr, decoratorName);
+            const entityPos = sourceFile.getLineAndCharacterOfPosition(classNode.getStart());
             const entity: RegisteredEntity = {
-                name: className,
+                // The name the runtime registers — what templates reference.
+                name: computeRegisteredEntityName(decoratorName, className, customName),
                 type: this.decoratorToEntityType(decoratorName),
                 tsFilePath: filePath,
                 className,
+                line: entityPos.line,
+                character: entityPos.character,
             };
-            // For transformers, compute the function name used in expressions
+            // For transformers, the registered name IS the function name used
+            // in expressions (Environment.addTransformer camelCases both
+            // custom and default names).
             if (decoratorName === 'Transformer') {
-                let funcName: string | undefined;
-                // Check for @Transformer('customName') — first string argument
-                if (decoratorExpr.arguments.length > 0) {
-                    const firstArg = decoratorExpr.arguments[0];
-                    if (ts.isStringLiteral(firstArg) || ts.isNoSubstitutionTemplateLiteral(firstArg)) {
-                        funcName = firstArg.text;
-                    }
-                }
-                // Default: lowercase first char of class name (convention: Helpers.toCamelCase)
-                if (!funcName) {
-                    funcName = className.charAt(0).toLowerCase() + className.slice(1);
-                }
-                entity.transformerFunctionName = funcName;
+                entity.transformerFunctionName = entity.name;
             }
             this.registeredEntities.push(entity);
         }
@@ -690,7 +945,13 @@ export class DecoratorAnalyzer {
         const classPos = sourceFile.getLineAndCharacterOfPosition(classNode.getStart());
         const members = this.extractMembers(classNode, sourceFile, checker);
 
-        const htmlInfo = this.resolveTemplateArg(decoratorExpr, sourceFile, filePath);
+        // @AppRoot string arguments are an element selector or a route config
+        // (never a template) — running them through resolveTemplateArg
+        // misclassified e.g. '#app' as an inline template and suppressed the
+        // index.html fallback below.
+        const htmlInfo = decoratorName === 'AppRoot'
+            ? null
+            : this.resolveTemplateArg(decoratorExpr, sourceFile, filePath);
 
         // For @AppRoot, if no explicit template was resolved, look for index.html in the same directory
         let htmlFilePath = htmlInfo?.filePath;
@@ -721,6 +982,32 @@ export class DecoratorAnalyzer {
             classCharacter: classPos.character,
             members,
         };
+    }
+
+    /**
+     * Extract a custom entity name from decorator arguments.
+     * `@Transformer('name')` carries it as the first string argument;
+     * Container / Component / Aspect only via the `['name', template]` array
+     * form (a bare string argument there is the template itself).
+     */
+    private extractCustomEntityName(decoratorExpr: ts.CallExpression, decoratorName: string): string | undefined {
+        if (decoratorExpr.arguments.length === 0) return undefined;
+        const firstArg = decoratorExpr.arguments[0];
+
+        if (decoratorName === 'Transformer') {
+            if (ts.isStringLiteral(firstArg) || ts.isNoSubstitutionTemplateLiteral(firstArg)) {
+                return firstArg.text;
+            }
+            return undefined;
+        }
+
+        if (ts.isArrayLiteralExpression(firstArg) && firstArg.elements.length >= 2) {
+            const nameElement = firstArg.elements[0];
+            if (ts.isStringLiteral(nameElement) || ts.isNoSubstitutionTemplateLiteral(nameElement)) {
+                return nameElement.text;
+            }
+        }
+        return undefined;
     }
 
     private getDecoratorName(callExpr: ts.CallExpression): string | null {
@@ -754,8 +1041,10 @@ export class DecoratorAnalyzer {
 
         const firstArg = decoratorExpr.arguments[0];
 
-        // String literal → inline template
+        // String literal → template path (e.g. './card.html') or inline markup
         if (ts.isStringLiteral(firstArg) || ts.isNoSubstitutionTemplateLiteral(firstArg)) {
+            const asPath = this.resolveTemplatePathLiteral(firstArg.text, filePath);
+            if (asPath) return { filePath: asPath };
             return { inline: firstArg.text };
         }
 
@@ -774,12 +1063,37 @@ export class DecoratorAnalyzer {
                 const importPath = this.resolveImportedIdentifier(second.text, sourceFile, filePath);
                 if (importPath) return { filePath: importPath };
             }
-            if (ts.isStringLiteral(second)) {
+            // Backtick templates are the natural multi-line inline form —
+            // the non-array path accepts both string kinds, so must this one.
+            if (ts.isStringLiteral(second) || ts.isNoSubstitutionTemplateLiteral(second)) {
+                const asPath = this.resolveTemplatePathLiteral(second.text, filePath);
+                if (asPath) return { filePath: asPath };
                 return { inline: second.text };
             }
         }
 
         return null;
+    }
+
+    /**
+     * The framework accepts a string template argument that is a *path* to an
+     * HTML file rather than inline markup. Markup always contains '<'; paths
+     * end in an HTML-ish extension. Resolve relative to the declaring TS file;
+     * only an existing file is accepted (the runtime may also resolve paths
+     * against the served root, which we cannot know — existence is the safe
+     * signal). Returns undefined when the string should be treated as inline.
+     */
+    private resolveTemplatePathLiteral(text: string, fromFile: string): string | undefined {
+        const trimmed = text.trim();
+        if (!trimmed || trimmed.includes('<') || trimmed.includes('\n')) return undefined;
+        if (!/\.(html?|xhtml)$/i.test(trimmed)) return undefined;
+        try {
+            const resolved = path.resolve(path.dirname(fromFile), trimmed);
+            if (fs.existsSync(resolved)) return normalizeSlashes(resolved);
+        } catch {
+            // unreadable fs — treat as inline
+        }
+        return undefined;
     }
 
     private resolveImportedIdentifier(identName: string, sourceFile: ts.SourceFile, filePath: string): string | null {
@@ -837,8 +1151,23 @@ export class DecoratorAnalyzer {
 
         for (const member of classNode.members) {
             if (!member.name) continue;
+            // Static members live on the constructor, not the instance —
+            // template expressions run with `.apply(instance)`, so `this.X`
+            // can never reach them. Listing them offered dead completions and
+            // let diagnostics silently accept `this.someStatic`.
+            if (this.hasStaticModifier(member)) continue;
+            // ECMAScript #private fields are unreachable from template
+            // expressions (`new Function` code outside the class can't even
+            // parse `this.#x`) — surfacing them offered completions that are
+            // a syntax error when accepted.
+            if (ts.isPrivateIdentifier(member.name)) continue;
             const nameText = member.name.getText(sourceFile);
-            const pos = sourceFile.getLineAndCharacterOfPosition(member.getStart());
+            // Anchor positions on the member NAME, not the declaration start —
+            // `member.getStart()` points at modifiers/decorators (`public`,
+            // `@Detector()`), which made rename replace the wrong characters
+            // and navigation land on the modifier.
+            const nameStart = member.name.getStart(sourceFile);
+            const pos = sourceFile.getLineAndCharacterOfPosition(nameStart);
             const isPublic = !this.hasPrivateModifier(member);
 
             let kind: ClassMember['kind'];
@@ -879,26 +1208,32 @@ export class DecoratorAnalyzer {
                 type,
                 line: pos.line,
                 character: pos.character,
-                offset: member.getStart(),
+                offset: nameStart,
                 isPublic,
             });
         }
 
-        // Constructor params with visibility modifiers
+        // Constructor parameter properties. ANY of public/protected/private/
+        // readonly creates an instance property — and `constructor(private
+        // changeDetector: ChangeDetector)` is the standard nuBond DI style.
+        // Expressions run with `.apply(context)`, so templates can reference
+        // private params at runtime; excluding them produced false
+        // "Property does not exist" diagnostics. `isPublic` mirrors the
+        // property-declaration rule: only `private` marks a member non-public.
         for (const member of classNode.members) {
             if (ts.isConstructorDeclaration(member)) {
                 for (const param of member.parameters) {
                     const paramMods = ts.getModifiers(param);
                     if (!paramMods) continue;
-                    const hasVisibility = paramMods.some(m =>
-                        m.kind === ts.SyntaxKind.PublicKeyword ||
-                        m.kind === ts.SyntaxKind.ProtectedKeyword
-                    );
-                    if (!hasVisibility) continue;
+                    if (!isParameterProperty(paramMods)) continue;
                     if (!param.name || !ts.isIdentifier(param.name)) continue;
 
-                    const pos = sourceFile.getLineAndCharacterOfPosition(param.getStart());
-                    const isPublic = paramMods.some(m => m.kind === ts.SyntaxKind.PublicKeyword);
+                    // Anchor on the parameter NAME — param.getStart() points
+                    // at the visibility modifier ('public x' would have its
+                    // 'public' keyword renamed/highlighted otherwise).
+                    const nameStart = param.name.getStart(sourceFile);
+                    const pos = sourceFile.getLineAndCharacterOfPosition(nameStart);
+                    const isPublic = !paramMods.some(m => m.kind === ts.SyntaxKind.PrivateKeyword);
                     let type = 'any';
                     if (param.type) type = param.type.getText(sourceFile);
 
@@ -908,20 +1243,122 @@ export class DecoratorAnalyzer {
                         type,
                         line: pos.line,
                         character: pos.character,
-                        offset: param.getStart(),
+                        offset: nameStart,
                         isPublic,
                     });
                 }
             }
         }
 
+        this.collectInheritedMembers(classNode, members, checker);
+
         return members;
+    }
+
+    /**
+     * Append members inherited from base classes (BUG: previously invisible,
+     * causing false "Property does not exist" diagnostics and missing
+     * completions for anything declared on a base class). Requires the
+     * TypeChecker — the checker-less `analyzeSourceText` path cannot resolve
+     * heritage and simply keeps own members only.
+     */
+    private collectInheritedMembers(
+        classNode: ts.ClassDeclaration,
+        members: ClassMember[],
+        checker?: ts.TypeChecker
+    ): void {
+        if (!checker || !classNode.name) return;
+        try {
+            const classSymbol = checker.getSymbolAtLocation(classNode.name);
+            if (!classSymbol) return;
+            const instanceType = checker.getDeclaredTypeOfSymbol(classSymbol);
+
+            for (const symbol of instanceType.getProperties()) {
+                const name = symbol.getName();
+                // Skip mangled/private-identifier names and anything already collected
+                if (!/^[A-Za-z_$][\w$]*$/.test(name)) continue;
+                if (members.some(m => m.name === name)) continue;
+
+                const decl = symbol.valueDeclaration ?? symbol.declarations?.[0];
+                if (!decl) continue;
+                // Own members (incl. constructor params) were collected above
+                if (decl.parent === classNode) continue;
+                if (ts.isParameter(decl) && decl.parent?.parent === classNode) continue;
+
+                const declFile = decl.getSourceFile();
+                // Skip default-lib members (Object.prototype etc. don't reach
+                // here via the declared type, but guard against lib mixins)
+                if (/lib\.[^/\\]*\.d\.ts$/.test(declFile.fileName)) continue;
+
+                let kind: ClassMember['kind'] = 'property';
+                if (ts.isMethodDeclaration(decl) || ts.isMethodSignature(decl)) kind = 'method';
+                else if (ts.isGetAccessorDeclaration(decl)) kind = 'getter';
+                else if (ts.isSetAccessorDeclaration(decl)) kind = 'setter';
+
+                const nameNode = (decl as ts.NamedDeclaration).name ?? decl;
+                const nameStart = nameNode.getStart(declFile);
+                const pos = declFile.getLineAndCharacterOfPosition(nameStart);
+
+                let isPublic = true;
+                if (ts.canHaveModifiers(decl)) {
+                    const mods = ts.getModifiers(decl);
+                    if (mods?.some(m => m.kind === ts.SyntaxKind.PrivateKeyword)) isPublic = false;
+                }
+
+                let type = 'any';
+                try {
+                    type = checker.typeToString(checker.getTypeOfSymbolAtLocation(symbol, classNode));
+                } catch {
+                    // keep 'any'
+                }
+
+                members.push({
+                    name,
+                    kind,
+                    type,
+                    line: pos.line,
+                    character: pos.character,
+                    offset: nameStart,
+                    isPublic,
+                    declaredIn: normalizeSlashes(declFile.fileName),
+                });
+            }
+        } catch {
+            // Checker hiccups must not break basic (own-member) extraction
+        }
     }
 
     private hasPrivateModifier(member: ts.ClassElement): boolean {
         const mods = ts.getModifiers(member as ts.HasModifiers);
         if (!mods) return false;
         return mods.some(m => m.kind === ts.SyntaxKind.PrivateKeyword);
+    }
+
+    private hasStaticModifier(member: ts.ClassElement): boolean {
+        const mods = ts.getModifiers(member as ts.HasModifiers);
+        if (!mods) return false;
+        return mods.some(m => m.kind === ts.SyntaxKind.StaticKeyword);
+    }
+
+    /**
+     * True when any member of this file's associations is declared in a file
+     * whose text changed (identity check failed) after `analyzedAt`. Those
+     * member records carry the declaring file's offsets/lines from an older
+     * parse — stale for rename fan-out and TS-rename delegation.
+     */
+    private hasStaleDeclarationDependency(fileKey: string, analyzedAt: number): boolean {
+        const assocs = this.tsToAssociations.get(fileKey);
+        if (!assocs) return false;
+        for (const assoc of assocs) {
+            for (const member of assoc.members) {
+                if (!member.declaredIn) continue;
+                const depKey = normalizePath(member.declaredIn);
+                if (depKey === fileKey) continue;
+                const changedAt = this.declChangeTicks.get(depKey);
+                if (changedAt !== undefined && changedAt > analyzedAt) return true;
+            }
+        }
+        return false;
     }
 
     private registerAssociation(assoc: TemplateAssociation): void {
@@ -942,8 +1379,91 @@ export class DecoratorAnalyzer {
     }
 }
 
+/** One service's analysis snapshot of a file: the AST identity + when. */
+interface AnalyzedFileRecord {
+    sourceFile: ts.SourceFile;
+    /** `analysisTick` value of the pass that analyzed this file. */
+    analyzedAt: number;
+}
+
+/**
+ * The member list of an interface OR a type alias with an object shape
+ * (`type X = { … }`) matching `cleanType`. The type-alias half was always
+ * promised by getTypeMembers' doc comment (and typeIndex records alias
+ * declarations), but only interface branches existed — `this.x.` with
+ * `x: SomeAliasShape` silently yielded no members.
+ */
+function getObjectShapeMembers(node: ts.Node, cleanType: string): readonly ts.TypeElement[] | undefined {
+    if (ts.isInterfaceDeclaration(node) && node.name.text === cleanType) {
+        return node.members;
+    }
+    if (ts.isTypeAliasDeclaration(node) && node.name.text === cleanType && ts.isTypeLiteralNode(node.type)) {
+        return node.type.members;
+    }
+    return undefined;
+}
+
+/**
+ * Case folding is only valid where the file system is case-insensitive —
+ * on Linux `Foo.ts` and `foo.ts` are DIFFERENT files, and folding both to
+ * one key made removeFile on one wipe the other's associations. Defaults to
+ * folding (the historical behavior) if `ts.sys` is unavailable.
+ */
+const FOLD_PATH_CASE = !(ts.sys?.useCaseSensitiveFileNames ?? false);
+
 function normalizePath(p: string): string {
-    return p.replace(/\\/g, '/').toLowerCase();
+    const forward = p.replace(/\\/g, '/');
+    return FOLD_PATH_CASE ? forward.toLowerCase() : forward;
+}
+
+/**
+ * True when a constructor parameter's modifiers make it a parameter property
+ * (an instance member): any of public / protected / private / readonly.
+ */
+export function isParameterProperty(mods: readonly ts.Modifier[]): boolean {
+    return mods.some(m =>
+        m.kind === ts.SyntaxKind.PublicKeyword ||
+        m.kind === ts.SyntaxKind.ProtectedKeyword ||
+        m.kind === ts.SyntaxKind.PrivateKeyword ||
+        m.kind === ts.SyntaxKind.ReadonlyKeyword
+    );
+}
+
+/** Mirror of the framework's `Helpers.toCamelCase` (first char lowercased). */
+function toCamelCaseName(value: string): string {
+    return value.charAt(0).toLowerCase() + value.slice(1);
+}
+
+/** Mirror of `Helpers.fromCamelToKebabCase(Helpers.toCamelCase(value))`. */
+function toKebabCaseName(value: string): string {
+    return toCamelCaseName(value).replace(/[A-Z]/g, m => '-' + m.toLowerCase());
+}
+
+/**
+ * Compute the name the framework registers an entity under at runtime —
+ * mirrors `Environment.addContainer` / `addComponent` / `addAspect` /
+ * `addTransformer`:
+ * - containers: custom name or class name, verbatim;
+ * - components/aspects: custom names containing '-' pass through verbatim,
+ *   everything else (custom or class name) is camelCased then kebab-cased
+ *   (`DragHandle` → `drag-handle`);
+ * - transformers: camelCase of the custom or class name.
+ */
+export function computeRegisteredEntityName(decoratorName: string, className: string, customName?: string): string {
+    switch (decoratorName) {
+        case 'Container':
+            return customName ?? className;
+        case 'Component':
+        case 'Aspect':
+            if (customName) {
+                return customName.indexOf('-') > 0 ? customName : toKebabCaseName(customName);
+            }
+            return toKebabCaseName(className);
+        case 'Transformer':
+            return toCamelCaseName(customName ?? className);
+        default:
+            return className;
+    }
 }
 
 function normalizeSlashes(p: string): string {
@@ -1056,9 +1576,14 @@ function parseProjectTsConfig(configPath: string): ts.CompilerOptions | undefine
 }
 
 /**
- * Test-only: clear the tsconfig parse cache between specs.
- * Production code never needs this — configs are static for a session.
+ * Clear the memoized tsconfig parse results. Wired into the restart-server
+ * command so edits to tsconfig.json are picked up without a window reload.
  */
-export function _clearTsConfigCacheForTest(): void {
+export function clearTsConfigCache(): void {
     parsedConfigCache.clear();
+}
+
+/** Test-only alias kept for existing specs. */
+export function _clearTsConfigCacheForTest(): void {
+    clearTsConfigCache();
 }

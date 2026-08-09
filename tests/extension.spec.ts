@@ -1,6 +1,13 @@
 import * as vscode from 'vscode';
 import { activate, deactivate } from '../src/extension';
 import { Constants } from '../src/constants';
+import * as workspaceDetection from '../src/core/workspace-detection';
+
+// The content-level activation gate is exercised on its own in
+// tests/core/workspace-detection.spec.ts. Here we mock it so the rest of the
+// activation flow can be tested without standing up a fake package.json on disk;
+// each test toggles its return value as needed.
+jest.mock('../src/core/workspace-detection');
 
 describe('Extension', () => {
     let context: vscode.ExtensionContext;
@@ -12,6 +19,9 @@ describe('Extension', () => {
         (vscode.workspace.getConfiguration as jest.Mock).mockReturnValue({
             get: jest.fn((key: string, defaultValue?: any) => defaultValue),
         });
+
+        // Default: workspace opts in to the language service so activation proceeds.
+        (workspaceDetection.isNubondLanguageServiceEnabled as jest.Mock).mockReturnValue(true);
 
         // Provide a disposable return for register methods so push doesn't fail
         const disposable = { dispose: jest.fn() };
@@ -102,6 +112,37 @@ describe('Extension', () => {
             expect(context.subscriptions.length).toBe(0);
         });
 
+        it('should not activate when the workspace does not opt in', () => {
+            (workspaceDetection.isNubondLanguageServiceEnabled as jest.Mock).mockReturnValue(false);
+
+            activate(context);
+
+            // Gate ran — and short-circuited before any provider registration.
+            expect(workspaceDetection.isNubondLanguageServiceEnabled).toHaveBeenCalled();
+            expect(vscode.languages.registerHoverProvider).not.toHaveBeenCalled();
+            expect(vscode.languages.registerCompletionItemProvider).not.toHaveBeenCalled();
+            expect(vscode.commands.registerCommand).not.toHaveBeenCalled();
+            expect(vscode.workspace.createFileSystemWatcher).not.toHaveBeenCalled();
+        });
+
+        it('should still create the output channel before bailing on a non-opted-in workspace', () => {
+            // The channel is created before the gate so the "staying inert" reason
+            // is logged. It is pushed as a subscription and disposed on deactivate.
+            (workspaceDetection.isNubondLanguageServiceEnabled as jest.Mock).mockReturnValue(false);
+
+            activate(context);
+
+            expect(vscode.window.createOutputChannel).toHaveBeenCalled();
+        });
+
+        it('should activate normally when the workspace opts in', () => {
+            (workspaceDetection.isNubondLanguageServiceEnabled as jest.Mock).mockReturnValue(true);
+
+            activate(context);
+
+            expect(vscode.languages.registerHoverProvider).toHaveBeenCalled();
+        });
+
         it('should listen for TS document changes', () => {
             activate(context);
             expect(vscode.workspace.onDidChangeTextDocument).toHaveBeenCalled();
@@ -120,6 +161,79 @@ describe('Extension', () => {
             // activate first so module-level variables are set
             activate(context);
             expect(() => deactivate()).not.toThrow();
+        });
+    });
+
+    // ---- Regression: ts-plugin renames corrupted unsaved HTML buffers ----
+    // The plugin computes rename offsets from disk; the extension must keep it
+    // informed which HTML files are dirty (via configurePlugin) so it can
+    // skip them instead of emitting stale-offset edits.
+    describe('ts-plugin dirty HTML bridge', () => {
+        it('activates cleanly when the TS extension is unavailable', async () => {
+            // Default mock: extensions.getExtension → undefined
+            expect(() => activate(context)).not.toThrow();
+            await new Promise(resolve => setTimeout(resolve, 10));
+        });
+
+        it('pushes dirty HTML files to the ts-plugin via configurePlugin', async () => {
+            const configurePlugin = jest.fn();
+            ((vscode as any).extensions.getExtension as jest.Mock).mockReturnValueOnce({
+                activate: () => Promise.resolve({ getAPI: (_v: number) => ({ configurePlugin }) }),
+            });
+
+            activate(context);
+            await new Promise(resolve => setTimeout(resolve, 10)); // let the async bridge wire up
+
+            // The bridge registers its own doc-change listener AFTER the TS
+            // re-analyzer's — take the most recent registration.
+            const changeCalls = (vscode.workspace.onDidChangeTextDocument as jest.Mock).mock.calls;
+            expect(changeCalls.length).toBeGreaterThanOrEqual(2);
+            const bridgeChangeListener = changeCalls[changeCalls.length - 1][0];
+
+            // An HTML document becomes dirty → its path is pushed
+            bridgeChangeListener({
+                document: { languageId: 'html', uri: { scheme: 'file', fsPath: '/test/tpl.html' }, isDirty: true },
+                contentChanges: [{}],
+            });
+            expect(configurePlugin).toHaveBeenCalledWith('ts-plugin', { dirtyHtmlFiles: ['/test/tpl.html'] });
+
+            // Repeat changes while already dirty do NOT re-push (no spam)
+            configurePlugin.mockClear();
+            bridgeChangeListener({
+                document: { languageId: 'html', uri: { scheme: 'file', fsPath: '/test/tpl.html' }, isDirty: true },
+                contentChanges: [{}],
+            });
+            expect(configurePlugin).not.toHaveBeenCalled();
+
+            // Saving clears the dirty flag → empty set is pushed
+            const saveCalls = (vscode.workspace.onDidSaveTextDocument as jest.Mock).mock.calls;
+            expect(saveCalls.length).toBeGreaterThanOrEqual(1);
+            const bridgeSaveListener = saveCalls[saveCalls.length - 1][0];
+            bridgeSaveListener({ languageId: 'html', uri: { scheme: 'file', fsPath: '/test/tpl.html' }, isDirty: false });
+            expect(configurePlugin).toHaveBeenCalledWith('ts-plugin', { dirtyHtmlFiles: [] });
+        });
+
+        it('ignores non-HTML and non-file documents', async () => {
+            const configurePlugin = jest.fn();
+            ((vscode as any).extensions.getExtension as jest.Mock).mockReturnValueOnce({
+                activate: () => Promise.resolve({ getAPI: (_v: number) => ({ configurePlugin }) }),
+            });
+
+            activate(context);
+            await new Promise(resolve => setTimeout(resolve, 10));
+
+            const changeCalls = (vscode.workspace.onDidChangeTextDocument as jest.Mock).mock.calls;
+            const bridgeChangeListener = changeCalls[changeCalls.length - 1][0];
+
+            bridgeChangeListener({
+                document: { languageId: 'typescript', uri: { scheme: 'file', fsPath: '/test/a.ts' }, isDirty: true },
+                contentChanges: [{}],
+            });
+            bridgeChangeListener({
+                document: { languageId: 'html', uri: { scheme: 'untitled', fsPath: '/test/x.html' }, isDirty: true },
+                contentChanges: [{}],
+            });
+            expect(configurePlugin).not.toHaveBeenCalled();
         });
     });
 
@@ -399,6 +513,39 @@ describe('Extension', () => {
                 (args: any[]) => (args[0] as string).replace(/\\/g, '/') === '/project/file.ts'
             );
             expect(htmlCalls.length).toBe(1);
+        });
+
+        // ---- Regression: deactivate() left pending debounce timers running;
+        // a timer firing after the workspace LS was disposed ran analysis
+        // against disposed state (restartServer cleared them — deactivation
+        // has to as well) ----
+        it('does not fire a pending TS-change timer after deactivate()', () => {
+            activate(context);
+
+            const tsWatcher = watchers[0];
+            const changeHandler: Function = (tsWatcher.onDidChange as jest.Mock).mock.calls[0][0];
+            changeHandler(vscode.Uri.file('/project/pending.ts'));
+            expect(readFileSpy).not.toHaveBeenCalled();
+
+            deactivate();
+            jest.advanceTimersByTime(600);
+            expect(readFileSpy).not.toHaveBeenCalled();
+        });
+
+        // ---- Round 3 nit: declaration files are excluded from the initial
+        // scan but the change handler fed them to the LanguageService anyway.
+        it('ignores .d.ts files in the change handler (mirrors the initial scan filter)', () => {
+            activate(context);
+
+            const tsWatcher = watchers[0];
+            const changeHandler: Function = (tsWatcher.onDidChange as jest.Mock).mock.calls[0][0];
+            changeHandler(vscode.Uri.file('/project/types.d.ts'));
+            jest.advanceTimersByTime(600);
+
+            const calledPaths = readFileSpy.mock.calls.map(
+                (args: any[]) => (args[0] as string).replace(/\\/g, '/')
+            );
+            expect(calledPaths).not.toContain('/project/types.d.ts');
         });
     });
 

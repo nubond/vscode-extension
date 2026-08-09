@@ -123,3 +123,27 @@ describe('nDocumentSymbolProvider', () => {
         expect(result![0].name).toContain('Projection');
     });
 });
+
+// ---- Round-2 regressions ----
+
+describe('nDocumentSymbolProvider — symbol range containment', () => {
+    it('parent full range spans the whole element so child symbols are contained', () => {
+        const provider = new nDocumentSymbolProvider();
+        const token = createCancellationToken();
+        const html = '<div nb-repeat="this.items">\n  <span nb-if="this.x">text</span>\n</div>';
+        const doc = createMockDocument(html);
+        const result = provider.provideDocumentSymbols(doc, token as any)!;
+        expect(result).toBeDefined();
+        expect(result.length).toBe(1);
+
+        const parent = result[0];
+        expect(parent.children.length).toBe(1);
+        const child = parent.children[0];
+
+        // VS Code's DocumentSymbol contract: child ranges must be contained
+        // in the parent's range.
+        expect(parent.range.contains(child.range)).toBe(true);
+        // The parent's range reaches the closing </div> on line 2
+        expect(parent.range.end.line).toBe(2);
+    });
+});

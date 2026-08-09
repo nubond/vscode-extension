@@ -2,7 +2,59 @@ import {
     parseExpression,
     findMemberAtOffset,
     getIdentifierAtOffset,
+    maskNonCode,
 } from '../../src/core/expression-parser';
+
+// ---- Round 3 (L5): regex literals derailed maskNonCode ----
+// A '/' after an operator/open-bracket starts a regex literal; quotes or '//'
+// INSIDE it must not open string/comment masking (which blanked live code
+// after the literal), and identifiers inside it are not member references.
+describe('maskNonCode regex literals', () => {
+    it('masks the regex pattern but keeps surrounding code live', () => {
+        const expr = "this.v.replace(/['\"]/g, '') + this.name";
+        const refs = parseExpression(expr).memberReferences.map(r => r.rootMember);
+        // Before the fix, the quote inside the character class opened string
+        // masking that swallowed `this.name`.
+        expect(refs).toEqual(['v', 'name']);
+    });
+
+    it('does not treat // inside a regex as a line comment', () => {
+        const expr = 'this.url.replace(/https:\\/\\//g, this.scheme)';
+        const refs = parseExpression(expr).memberReferences.map(r => r.rootMember);
+        expect(refs).toEqual(['url', 'scheme']);
+    });
+
+    it('does not extract member references from inside a regex', () => {
+        const expr = '/this\\.x/.test(this.y)';
+        const refs = parseExpression(expr).memberReferences.map(r => r.rootMember);
+        expect(refs).toEqual(['y']);
+    });
+
+    it('masks regex flags so they do not read as identifiers', () => {
+        const masked = maskNonCode('this.s.match(/item/gi)');
+        expect(masked).not.toContain('item');
+        expect(masked).not.toContain('gi');
+    });
+
+    it('still treats / after a value as division', () => {
+        const expr = 'this.a / this.b / 2';
+        const refs = parseExpression(expr).memberReferences.map(r => r.rootMember);
+        expect(refs).toEqual(['a', 'b']);
+    });
+
+    it('preserves offsets (masked string has identical length)', () => {
+        const expr = "this.v.replace(/['\"]+/g, '') + this.name";
+        expect(maskNonCode(expr).length).toBe(expr.length);
+    });
+
+    it('treats an unterminated regex candidate as plain code (no mask to end of input)', () => {
+        // '=' before '/' says "regex possible", but there is no closing '/' —
+        // masking to end-of-input would hide this.ratio.
+        const expr = 'this.mode = / this.ratio';
+        const refs = parseExpression(expr).memberReferences.map(r => r.rootMember);
+        expect(refs).toEqual(['mode', 'ratio']);
+    });
+});
 
 describe('expression-parser', () => {
     describe('parseExpression', () => {
@@ -169,5 +221,84 @@ describe('expression-parser', () => {
             expect(result).toBeDefined();
             expect(result!.word).toBe('$_name');
         });
+    });
+});
+
+// ---- Round-2 regressions: non-code masking ----
+
+describe('extractMemberReferences — strings and comments are not code', () => {
+    it('ignores this.X inside single-quoted strings', () => {
+        const info = parseExpression("'a note about this.legacy'");
+        expect(info.memberReferences).toHaveLength(0);
+    });
+
+    it('ignores this.X inside double-quoted strings', () => {
+        const info = parseExpression('this.track("this.oldName")');
+        expect(info.memberReferences).toHaveLength(1);
+        expect(info.memberReferences[0].rootMember).toBe('track');
+    });
+
+    it('ignores template-literal text but keeps ${ } interiors live', () => {
+        const info = parseExpression('`Hello ${this.name}, see this.notARef`');
+        expect(info.memberReferences).toHaveLength(1);
+        expect(info.memberReferences[0].rootMember).toBe('name');
+    });
+
+    it('ignores line comments', () => {
+        const info = parseExpression('this.a // this.b');
+        expect(info.memberReferences).toHaveLength(1);
+        expect(info.memberReferences[0].rootMember).toBe('a');
+    });
+
+    it('still ignores block comments', () => {
+        const info = parseExpression('this.a /* this.b */ + this.c');
+        const roots = info.memberReferences.map(r => r.rootMember);
+        expect(roots).toEqual(['a', 'c']);
+    });
+
+    it('keeps offsets aligned for references after a masked string', () => {
+        const expr = "this.format('x') && this.value";
+        const info = parseExpression(expr);
+        const value = info.memberReferences.find(r => r.rootMember === 'value')!;
+        expect(value.start).toBe(expr.indexOf('this.value'));
+        expect(expr.substring(value.start, value.end)).toBe('this.value');
+    });
+
+    it('handles escaped quotes inside strings', () => {
+        // runtime expression: this.say('it\'s this.fake') || this.real
+        const info = parseExpression("this.say('it\\'s this.fake') || this.real");
+        const roots = info.memberReferences.map(r => r.rootMember);
+        expect(roots).toEqual(['say', 'real']);
+    });
+});
+
+describe('maskNonCode — string literals inside ${ } interpolations', () => {
+    // Regression: the template-literal scanner skipped `${ … }` tracking
+    // brace depth only — strings inside the interpolation stayed live,
+    // yielding phantom member references (false "does not exist"
+    // diagnostics, phantom rename hits) and miscounted braces in strings.
+    it('masks string literals nested inside interpolations', () => {
+        const info = parseExpression("`${this.fmt('use this.total here')}`");
+        const roots = info.memberReferences.map(r => r.rootMember);
+        expect(roots).toContain('fmt');
+        expect(roots).not.toContain('total');
+    });
+
+    it('does not miscount braces inside interpolation strings', () => {
+        const info = parseExpression("`${this.fmt('}')} ${this.name}`");
+        const roots = info.memberReferences.map(r => r.rootMember);
+        expect(roots).toEqual(['fmt', 'name']);
+    });
+
+    it('handles a template literal nested inside an interpolation', () => {
+        const info = parseExpression('`${ `${this.inner}` } this.outerText `');
+        const roots = info.memberReferences.map(r => r.rootMember);
+        expect(roots).toEqual(['inner']);
+    });
+
+    it('keeps object literals inside interpolations working', () => {
+        const info = parseExpression('`${ this.pick({ a: this.left, b: 2 }) } text`');
+        const roots = info.memberReferences.map(r => r.rootMember);
+        expect(roots).toEqual(['pick', 'left']);
     });
 });

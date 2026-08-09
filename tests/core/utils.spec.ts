@@ -103,12 +103,14 @@ describe('utils', () => {
             expect(result).toBeUndefined();
         });
 
-        it('should return parent type if chain member not found', () => {
+        it('should fail closed (undefined) if a chain member is not found', () => {
+            // Regression: returning the parent's type made `this.user.nonExistent`
+            // report as `User` — wrong hover types and wrong nb-repeat item types.
             const associations = [{ members: [{ name: 'user', type: 'User' }] }];
             const findMember = (assoc: any, name: string) => assoc.members.find((m: any) => m.name === name);
             const findMemberWithType = () => undefined;
             const result = resolveChainType(['user', 'unknown'], associations, findMember, findMemberWithType);
-            expect(result).toBe('User');
+            expect(result).toBeUndefined();
         });
     });
 
@@ -329,5 +331,39 @@ describe('utils', () => {
             const info = getElementManipulationMemberInfo('classes', 'unknownMethod');
             expect(info).toBeUndefined();
         });
+    });
+});
+
+// ---- Round-2 regressions: inferItemType collection coverage ----
+
+describe('inferItemType — extended collection kinds', () => {
+    it('resolves ReadonlyArray<T>', () => {
+        expect(inferItemType('ReadonlyArray<User>')).toBe('User');
+    });
+
+    it('resolves Set<T>', () => {
+        expect(inferItemType('Set<string>')).toBe('string');
+    });
+
+    it('resolves typed arrays to number', () => {
+        expect(inferItemType('Int32Array')).toBe('number');
+        expect(inferItemType('Float64Array')).toBe('number');
+        expect(inferItemType('Uint8ClampedArray')).toBe('number');
+    });
+
+    it('resolves BigInt64Array to bigint', () => {
+        expect(inferItemType('BigInt64Array')).toBe('bigint');
+    });
+
+    // Round-4 L7: nb-repeat converts Map via Array.from — each item is the
+    // [key, value] ENTRY TUPLE, not the value type.
+    it('resolves Map<K, V> to the entry tuple', () => {
+        expect(inferItemType('Map<string, User>')).toBe('[string, User]');
+        expect(inferItemType('ReadonlyMap<number, string>')).toBe('[number, string]');
+    });
+
+    it('keeps unknown collections as any', () => {
+        expect(inferItemType('CustomCollection<User>')).toBe('any');
+        expect(inferItemType('WeakMap<object, User>')).toBe('any');
     });
 });

@@ -185,4 +185,64 @@ describe('globals-registry', () => {
             }
         });
     });
+
+    // ---- Round 4c: non-framework help verification & updates ----
+    describe('round 4c — browser-globals help content', () => {
+        it('registers location with URL members and the router-preference note', () => {
+            const members = getGlobalObjectMembers('location');
+            expect(members).toBeDefined();
+            const names = members!.map(m => m.name);
+            for (const n of ['href', 'origin', 'pathname', 'search', 'hash', 'assign', 'replace', 'reload']) {
+                expect(names).toContain(n);
+            }
+            const loc = getAllGlobalObjects().find(o => o.name === 'location')!;
+            expect(loc.desc).toMatch(/Router/);
+        });
+
+        it('registers navigator with common members', () => {
+            const names = getGlobalObjectMembers('navigator')!.map(m => m.name);
+            for (const n of ['userAgent', 'language', 'onLine', 'clipboard', 'sendBeacon']) {
+                expect(names).toContain(n);
+            }
+        });
+
+        it('registers localStorage and sessionStorage with the Storage API', () => {
+            for (const storage of ['localStorage', 'sessionStorage']) {
+                const names = getGlobalObjectMembers(storage)!.map(m => m.name);
+                for (const n of ['getItem', 'setItem', 'removeItem', 'clear', 'key', 'length']) {
+                    expect(names).toContain(n);
+                }
+            }
+        });
+
+        it('registers structuredClone and queueMicrotask as global functions', () => {
+            const names = getAllGlobalFunctions().map(f => f.name);
+            expect(names).toContain('structuredClone');
+            expect(names).toContain('queueMicrotask');
+            const sc = getAllGlobalFunctions().find(f => f.name === 'structuredClone')!;
+            expect(sc.desc).toMatch(/nb-in/);
+            expect(sc.desc).toMatch(/DataCloneError/);
+        });
+
+        it('async APIs carry the change-detection framework note (callbacks run outside detection)', () => {
+            const fns = getAllGlobalFunctions();
+            for (const name of ['setTimeout', 'setInterval', 'fetch', 'requestAnimationFrame', 'queueMicrotask']) {
+                const fn = fns.find(f => f.name === name)!;
+                expect(fn.desc).toMatch(/change detection/);
+            }
+            const windowMembers = getGlobalObjectMembers('window')!;
+            for (const name of ['setTimeout', 'setInterval', 'fetch', 'requestAnimationFrame']) {
+                const m = windowMembers.find(mm => mm.name === name)!;
+                expect(m.desc).toMatch(/change detection/);
+            }
+            // Synchronous cancel functions must NOT carry the note.
+            expect(fns.find(f => f.name === 'clearTimeout')!.desc).not.toMatch(/change detection/);
+        });
+
+        it('prompt does not use the reserved word `default` as a parameter name', () => {
+            const prompt = getGlobalObjectMembers('window')!.find(m => m.name === 'prompt')!;
+            expect(prompt.type).not.toMatch(/\bdefault\??:/);
+            expect(prompt.type).toMatch(/defaultValue/);
+        });
+    });
 });

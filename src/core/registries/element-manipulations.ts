@@ -26,14 +26,14 @@ const ELEMENT_SUB_MEMBERS: Record<string, Record<string, MemberInfo>> = {
         has:    { type: '(attributeName: string) => boolean',                      desc: 'Check whether the element has the specified HTML attribute',         kind: 'method' },
         get:    { type: '(attributeName: string) => string | undefined',           desc: 'Get the value of an HTML attribute, or `undefined` if absent',       kind: 'method' },
         getAll: { type: '() => Map<string, string | undefined>',                   desc: 'Get a `Map` of all HTML attributes on the element',                  kind: 'method' },
-        set:    { type: '(attributeName: string, attributeValue?: string | null) => void', desc: 'Set an HTML attribute; pass `null` to create a valueless attribute', kind: 'method' },
+        set:    { type: '(attributeName: string, attributeValue?: string | null) => void', desc: 'Set an HTML attribute; `null` / `undefined` REMOVES it — pass `\'\'` for a valueless attribute', kind: 'method' },
         remove: { type: '(attributeName: string) => void',                         desc: 'Remove an HTML attribute from the element',                          kind: 'method' },
     },
     styles: {
         has:    { type: '(propertyName: string) => boolean',                       desc: 'Check whether the element has the specified inline style',           kind: 'method' },
         get:    { type: '(propertyName: string) => string | undefined',            desc: 'Get the value of an inline style property',                          kind: 'method' },
         getAll: { type: '() => Map<string, string>',                               desc: 'Get a `Map` of all inline styles on the element',                    kind: 'method' },
-        set:    { type: '(propertyName: string, propertyValue?: string | null) => void', desc: 'Set an inline style property value',                           kind: 'method' },
+        set:    { type: '(propertyName: string, propertyValue?: string | null) => void', desc: 'Set an inline style property (kebab-case name); `null` / `undefined` / `\'\'` removes it', kind: 'method' },
         remove: { type: '(propertyName: string) => void',                          desc: 'Remove an inline style property from the element',                   kind: 'method' },
     },
     classes: {
