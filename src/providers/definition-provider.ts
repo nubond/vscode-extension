@@ -8,7 +8,7 @@ import * as vscode from 'vscode';
 import { logError } from '../core/logger';
 import { findBindingAtOffset, getAllLocalVars, getAllRepeatScopes, isEvaluatedBinding } from '../core/template-parser';
 import { parseTemplateCached } from '../core/template-parser-cache';
-import { parseExpression, findMemberAtOffset, getIdentifierAtOffset, maskNonCode, MemberReference } from '../core/expression-parser';
+import { parseExpression, findMemberAtOffset, getIdentifierAtOffset, maskNonCode } from '../core/expression-parser';
 import { DecoratorAnalyzer } from '../core/decorator-analyzer';
 import { getChainIndexAtOffset } from '../core/utils';
 

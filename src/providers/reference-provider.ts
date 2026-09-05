@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import { logError } from '../core/logger';
 import { parseTemplate, findBindingAtOffset, isEvaluatedBinding } from '../core/template-parser';
 import { parseTemplateCached } from '../core/template-parser-cache';
-import { parseExpression, findMemberAtOffset, MemberReference } from '../core/expression-parser';
+import { parseExpression, findMemberAtOffset } from '../core/expression-parser';
 import { DecoratorAnalyzer } from '../core/decorator-analyzer';
 import { buildLineIndex, offsetToLineChar, getAbsoluteMemberRange, getChainIndexAtOffset, arePathsEqual } from '../core/utils';
 

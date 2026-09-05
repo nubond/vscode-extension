@@ -195,7 +195,7 @@ describe('Extension', () => {
                 document: { languageId: 'html', uri: { scheme: 'file', fsPath: '/test/tpl.html' }, isDirty: true },
                 contentChanges: [{}],
             });
-            expect(configurePlugin).toHaveBeenCalledWith('ts-plugin', { dirtyHtmlFiles: ['/test/tpl.html'] });
+            expect(configurePlugin).toHaveBeenCalledWith(Constants.TS_PLUGIN_NAME, { dirtyHtmlFiles: ['/test/tpl.html'] });
 
             // Repeat changes while already dirty do NOT re-push (no spam)
             configurePlugin.mockClear();
@@ -210,7 +210,7 @@ describe('Extension', () => {
             expect(saveCalls.length).toBeGreaterThanOrEqual(1);
             const bridgeSaveListener = saveCalls[saveCalls.length - 1][0];
             bridgeSaveListener({ languageId: 'html', uri: { scheme: 'file', fsPath: '/test/tpl.html' }, isDirty: false });
-            expect(configurePlugin).toHaveBeenCalledWith('ts-plugin', { dirtyHtmlFiles: [] });
+            expect(configurePlugin).toHaveBeenCalledWith(Constants.TS_PLUGIN_NAME, { dirtyHtmlFiles: [] });
         });
 
         it('ignores non-HTML and non-file documents', async () => {

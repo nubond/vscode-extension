@@ -278,7 +278,6 @@ function splitExpressions(expression: string): string[] {
 
     for (let i = 0; i < expression.length; i++) {
         const ch = expression[i];
-        const prev = i > 0 ? expression[i - 1] : '';
 
         if (inString) {
             current += ch;

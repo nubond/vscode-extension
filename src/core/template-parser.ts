@@ -4,7 +4,6 @@
  */
 
 import { buildLineIndex, offsetToLineChar } from './utils';
-import type { LineIndex } from './utils';
 
 export interface TemplateAttribute {
     /** Full attribute name as-is: "nb-event:click:300" */
@@ -441,12 +440,6 @@ function buildTree(
 
     // For each opening tag, find its matching closing tag to determine true element end
     // Use a simple stack-based approach for nesting
-    interface TagEntry {
-        element: TemplateElement;
-        elementEnd: number; // position after closing tag
-    }
-
-    const stack: TagEntry[] = [];
     // Process elements in order, assigning closing positions
     const elementEnds = new Map<TemplateElement, number>();
 

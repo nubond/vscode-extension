@@ -6,8 +6,8 @@
 
 import * as vscode from 'vscode';
 import { logError } from '../core/logger';
-import { getHandlerInfo, buildHandlerDocumentation, isNAttribute } from '../core/attribute-registry';
-import { findBindingAtOffset, isInRepeatScope, getAllRepeatScopes, getAllLocalVars, findElementAtOffset, isEvaluatedBinding } from '../core/template-parser';
+import { getHandlerInfo, buildHandlerDocumentation } from '../core/attribute-registry';
+import { findBindingAtOffset, getAllRepeatScopes, getAllLocalVars, findElementAtOffset, isEvaluatedBinding } from '../core/template-parser';
 import { parseTemplateCached } from '../core/template-parser-cache';
 import type { TemplateAttribute, ParsedTemplate } from '../core/template-parser';
 import { parseExpression, findMemberAtOffset, maskNonCode, MemberReference } from '../core/expression-parser';
@@ -15,7 +15,7 @@ import { DecoratorAnalyzer } from '../core/decorator-analyzer';
 import type { TemplateAssociation } from '../core/decorator-analyzer';
 import { inferItemType, getEventType, getElementType, getChainIndexAtOffset, resolveChainType, getEventMemberInfo, getDomMemberInfo, getElementManipulationMemberInfo } from '../core/utils';
 import type { MemberInfo } from '../core/utils';
-import { getModelInjection, getModelInjectionByType, getModelInjectionMember } from '../core/model-injections-registry';
+import { getModelInjection, getModelInjectionByType } from '../core/model-injections-registry';
 
 export class nHoverProvider implements vscode.HoverProvider {
     constructor(private analyzer: DecoratorAnalyzer) {}

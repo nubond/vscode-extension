@@ -4,9 +4,10 @@ tests/**
 tsconfig.json
 esbuild.js
 jest.config.js
+eslint.config.js
 features.md
-**/*.map
 node_modules/**
-!node_modules/ts-plugin/**
+!node_modules/@nubond/ts-plugin/**
+!node_modules/typescript/**
 .gitignore
 coverage/

@@ -1123,7 +1123,7 @@ export class DecoratorAnalyzer {
 
     private resolveModulePath(modulePath: string, fromFile: string): string {
         const dir = path.dirname(fromFile);
-        let resolved = path.resolve(dir, modulePath);
+        const resolved = path.resolve(dir, modulePath);
         if (!path.extname(resolved)) {
             // Try with common extensions, check if file exists
             for (const ext of ['.html', '.ts', '.js']) {

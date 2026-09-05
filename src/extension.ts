@@ -232,7 +232,7 @@ async function initTsPluginDirtyHtmlBridge(context: vscode.ExtensionContext): Pr
 
 function pushDirtyHtmlFiles(): void {
     try {
-        tsPluginConfigApi?.configurePlugin('ts-plugin', { dirtyHtmlFiles: Array.from(dirtyHtmlFiles) });
+        tsPluginConfigApi?.configurePlugin(Constants.TS_PLUGIN_NAME, { dirtyHtmlFiles: Array.from(dirtyHtmlFiles) });
     } catch (err) {
         logError('pushDirtyHtmlFiles', err);
     }
