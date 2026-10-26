@@ -387,10 +387,11 @@ describe('attribute-registry', () => {
             expect(info.notes ?? '').toMatch(/null/);
         });
 
-        it('nb-style documents kebab-case-only property names and the !important limitation', () => {
+        it('nb-style documents kebab-case-only property names and !important priority support', () => {
             const info = getHandlerInfo('nb-style')!;
             expect(info.notes ?? '').toMatch(/kebab/i);
             expect(info.notes ?? '').toMatch(/!important/);
+            expect(info.notes ?? '').toMatch(/priority/i);
         });
 
         it('nb-switch and nb-case document stringified matching', () => {

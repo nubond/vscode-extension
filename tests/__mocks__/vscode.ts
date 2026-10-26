@@ -58,7 +58,8 @@ export class Uri {
         this.path = path;
         this.query = query;
         this.fragment = fragment;
-        this.fsPath = path.replace(/\//g, '\\');
+        // Native separators, like the real Uri: backslashes only on Windows.
+        this.fsPath = process.platform === 'win32' ? path.replace(/\//g, '\\') : path;
     }
 
     static file(path: string): Uri {

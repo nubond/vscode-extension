@@ -1328,8 +1328,12 @@ class TestContainer {
     // than VS Code's uri.fsPath (e.g., 'C:/Src/Foo.ts' vs 'c:/src/foo.ts'), so stale
     // typeIndex entries were never evicted and accumulated until a full restart.
     // After fix: normalizePath (lowercase) is used on both sides for comparison.
+    // Path case is folded only on case-insensitive file systems (FOLD_PATH_CASE in
+    // decorator-analyzer.ts); on Linux 'TypeDefs.ts' and 'typedefs.ts' are distinct files.
+    const caseInsensitiveFs = !(ts.sys?.useCaseSensitiveFileNames ?? false);
+
     describe('removeFile typeIndex case-insensitive normalization', () => {
-        it('should evict typeIndex entries even when removeFile path casing differs', () => {
+        (caseInsensitiveFs ? it : it.skip)('should evict typeIndex entries even when removeFile path casing differs', () => {
             // Simulate TypeScript compiler storing a path with mixed case
             const mixedCasePath = '/test/TypeDefs.ts';
             const typeSource = `
@@ -1357,6 +1361,28 @@ class TestContainer {
 
                 // readFileSync must NOT have been called — the entry was removed, not just missed
                 expect(readSpy).not.toHaveBeenCalled();
+            } finally {
+                readSpy.mockRestore();
+            }
+        });
+
+        (caseInsensitiveFs ? it.skip : it)('should keep typeIndex entries when removeFile names a differently-cased file on a case-sensitive FS', () => {
+            const typeSource = `
+                export interface CaseSensitiveType { value: number; }
+            `;
+            analyzer.analyzeSourceText('/test/TypeDefs.ts', typeSource);
+
+            const fsMod = require('fs');
+            const readSpy = jest.spyOn(fsMod, 'readFileSync').mockReturnValue(typeSource);
+
+            try {
+                // A different file on this FS — must not evict TypeDefs.ts's entries
+                analyzer.removeFile('/test/typedefs.ts');
+                expect(analyzer.getTypeMembers('CaseSensitiveType')).toBeDefined();
+
+                // The exact path still evicts
+                analyzer.removeFile('/test/TypeDefs.ts');
+                expect(analyzer.getTypeMembers('CaseSensitiveType')).toBeUndefined();
             } finally {
                 readSpy.mockRestore();
             }

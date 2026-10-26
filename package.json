@@ -2,7 +2,7 @@
   "name": "nubond-language-service",
   "displayName": "nuBond Language Service",
   "description": "VS Code language service for the nuBond framework — IntelliSense, Go to Definition, Find References, Rename, hover docs, diagnostics, and CodeLens across HTML templates and their TypeScript classes.",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "publisher": "nuBond",
   "homepage": "https://github.com/nubond/vscode-extension",
   "repository": {
