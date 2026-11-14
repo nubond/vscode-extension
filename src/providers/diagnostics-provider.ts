@@ -11,7 +11,7 @@ import * as vscode from 'vscode';
 import { ParsedTemplate, TemplateAttribute, getAllRepeatScopes, getAllLocalVars, isEvaluatedBinding, kebabToCamelCase, RESERVED_CONTEXT_NAMES } from '../core/template-parser';
 import { parseTemplateCached } from '../core/template-parser-cache';
 import { parseExpression, maskNonCode } from '../core/expression-parser';
-import { isNAttribute, getHandlerInfo, ALL_NB_ATTRIBUTES, PREFIX_ATTRIBUTES } from '../core/attribute-registry';
+import { isNAttribute, getHandlerInfo, ALL_NB_ATTRIBUTES, PREFIX_ATTRIBUTES, COMMON_DOM_EVENTS } from '../core/attribute-registry';
 import { getAllGlobalObjects, getAllGlobalFunctions, getAllGlobalConstants } from '../core/globals-registry';
 import { DecoratorAnalyzer } from '../core/decorator-analyzer';
 import { logError } from '../core/logger';
@@ -45,7 +45,8 @@ const EXPRESSION_VALUE_HANDLERS: ReadonlySet<string> = new Set([
 /**
  * DOM properties the Properties handler rejects with a console error, keyed
  * by the lowercased camelCase name the runtime derives from the suffix.
- * `outerHTML` joined the runtime blocklist in the framework's 2026-07-13 fixes.
+ * `outerHTML` joined the runtime blocklist in the framework's 2026-07-13 fixes,
+ * `__proto__` in the 2026-11-04 ones (framework L-22).
  */
 const BLOCKED_PROP_TARGETS: ReadonlyMap<string, string> = new Map([
     ['classlist', "use 'nb-class' instead"],
@@ -55,6 +56,7 @@ const BLOCKED_PROP_TARGETS: ReadonlyMap<string, string> = new Map([
     ['innertext', "use 'nb-value' instead"],
     ['innerhtml', "use 'nb-html' instead"],
     ['outerhtml', "'outerHTML' cannot be changed at all"],
+    ['__proto__', "'__proto__' cannot be changed (it would replace the element's prototype)"],
 ]);
 
 const NB_EXACT_NAMES: ReadonlySet<string> = new Set(ALL_NB_ATTRIBUTES);
@@ -78,17 +80,67 @@ const EXACT_APPLICABLE_HANDLERS: ReadonlySet<string> = new Set(
     ALL_NB_ATTRIBUTES.filter(a => !PREFIX_ATTRIBUTES.includes(a) && !EXTENSION_ONLY_ATTRIBUTES.has(a)));
 
 /**
+ * Prefix handlers that do NOT grant N-applicability: the runtime keeps
+ * nb-in / nb-in-ref in KNOWN_HANDLER_PREFIX_EXTENSIONS (framework L-21), read
+ * only by the nb-container / component handler on the same element. They are
+ * still system attributes, so they stay reserved as `nb-attr:` targets.
+ */
+const NON_APPLICABLE_PREFIX_ATTRIBUTES: ReadonlySet<string> = new Set(['nb-in', 'nb-in-ref']);
+
+/**
+ * Prefix handlers that grant N-applicability, WITH their ':' separator
+ * (runtime KNOWN_PREFIX_HANDLERS_WITH_META_SEPARATOR, framework L-16): 'nb-var:x'
+ * qualifies, 'nb-variant' does not.
+ */
+const APPLICABLE_PREFIX_ATTRIBUTES: ReadonlyArray<string> =
+    PREFIX_ATTRIBUTES.filter(p => !NON_APPLICABLE_PREFIX_ATTRIBUTES.has(p)).map(p => p + ':');
+
+/** Prefix handlers that are also valid bare (runtime KNOWN_PREFIX_HANDLERS_WITH_OPTIONAL_META). */
+const BARE_VALID_PREFIX_ATTRIBUTES: ReadonlySet<string> = new Set(['nb-repeat']);
+
+/**
  * True when this attribute makes its element N-applicable at runtime.
- * Mirrors `Attributes.isNApplicable`: exact KNOWN_HANDLERS_SET membership or
- * a startsWith match against a prefix handler — the latter is a plain
- * `indexOf(...) === 0` in the runtime, so even an unknown name like
- * 'nb-index' qualifies (it starts with 'nb-in'). Checked on the normalized
- * full name; the parser's W3C normalization preserves every startsWith
- * relationship ('data-nb-index' → 'nb-index').
+ * Mirrors `Attributes.isNApplicable`: exact KNOWN_HANDLERS_SET membership, a
+ * bare 'nb-repeat', or a startsWith match against a prefix handler WITH its
+ * ':' (framework L-16) — so look-alikes such as 'nb-eventx', 'nb-variant' or
+ * 'nb-index' do not qualify, and nb-in / nb-in-ref never do (L-21). Checked
+ * on the normalized full name; the parser's W3C normalization maps '--' to
+ * ':' ('data-nb-var--x' → 'nb-var:x').
  */
 function grantsNApplicability(attr: TemplateAttribute): boolean {
     return EXACT_APPLICABLE_HANDLERS.has(attr.fullName) ||
-           PREFIX_ATTRIBUTES.some(p => attr.fullName.startsWith(p));
+           BARE_VALID_PREFIX_ATTRIBUTES.has(attr.fullName) ||
+           APPLICABLE_PREFIX_ATTRIBUTES.some(p => attr.fullName.startsWith(p));
+}
+
+/** Lowercased names of the common DOM events (for the broken-debounce check). */
+const KNOWN_DOM_EVENT_NAMES: ReadonlySet<string> = new Set(COMMON_DOM_EVENTS.map(e => e.name.toLowerCase()));
+
+interface RuntimeEventKey {
+    /** The event name the runtime subscribes to (also its expression-map key). */
+    eventName: string;
+    /** Text after the last ':' (present only when that ':' is not the first character). */
+    tail?: string;
+    /** Debounce the runtime reads from `tail` with parseInt, when it yields a number. */
+    debounce?: number;
+}
+
+/**
+ * Mirror of the Events handler constructor: the text after 'nb-event:' is
+ * split at its LAST ':' only when `parseInt(tail, 10)` is a number; otherwise
+ * the whole remainder is the event name ('nb-event:plugin:ready' → 'plugin:ready',
+ * 'nb-event:click:abc' → 'click:abc', 'nb-event:click:300abc' → 'click' + 300).
+ * The browser lowercases attribute names, so the result is lowercased.
+ */
+function runtimeEventKey(attr: TemplateAttribute): RuntimeEventKey {
+    const raw = attr.fullName.substring('nb-event:'.length).toLowerCase();
+    const index = raw.lastIndexOf(':');
+    if (index > 0) {
+        const tail = raw.substring(index + 1);
+        const debounce = parseInt(tail, 10);
+        return isNaN(debounce) ? { eventName: raw, tail } : { eventName: raw.substring(0, index), tail, debounce };
+    }
+    return { eventName: raw };
 }
 
 /**
@@ -107,18 +159,19 @@ const PREFIX_SUFFIX_EXAMPLES: ReadonlyMap<string, string> = new Map([
 
 /**
  * Mirror of the Attributes constructor's reserved-name rejection for
- * `nb-attr:` targets: exact known handler / extension names are blocked, and
- * so is anything STARTING WITH a prefix-handler name (the runtime check is a
- * plain startsWith — `nb-attr:nb-index` is rejected because 'nb-index'
- * startsWith 'nb-in'). W3C spellings are normalized first so both modes are
- * covered.
+ * `nb-attr:` targets (framework L-16): exact known handler / extension names
+ * and bare prefix-handler names ('nb-var', 'nb-in', …) are blocked, and so is
+ * anything starting with a prefix handler PLUS its ':' ('nb-var:x'). A
+ * look-alike such as 'nb-index' or 'nb-variant' is NOT blocked. W3C spellings
+ * are normalized first so both modes are covered.
  */
 function isFrameworkReservedAttrTarget(suffix: string): boolean {
     const lower = suffix.toLowerCase();
     const normalized = lower.startsWith('data-nb-')
         ? 'nb-' + lower.substring('data-nb-'.length).replace(/--/g, ':')
         : lower;
-    return NB_EXACT_NAMES.has(normalized) || PREFIX_ATTRIBUTES.some(p => normalized.startsWith(p));
+    return NB_EXACT_NAMES.has(normalized) ||
+           PREFIX_ATTRIBUTES.some(p => normalized.startsWith(p + ':'));
 }
 
 export class nDiagnosticsProvider implements vscode.Disposable {
@@ -234,7 +287,7 @@ export class nDiagnosticsProvider implements vscode.Disposable {
                         document.positionAt(binding.nameSpan.start),
                         document.positionAt(binding.nameSpan.end)
                     ),
-                    `Unknown ${Constants.DISPLAY_NAME} attribute: '${binding.baseName}'. Did you mean one of the known nb-* attributes?`,
+                    `Unknown ${Constants.DISPLAY_NAME} attribute: '${binding.baseName}'. The runtime keeps it as a plain HTML attribute and binds nothing. Did you mean one of the known nb-* attributes?`,
                     vscode.DiagnosticSeverity.Warning
                 ));
                 continue;
@@ -505,15 +558,15 @@ export class nDiagnosticsProvider implements vscode.Disposable {
 
         const handler = getHandlerInfo(binding.baseName);
 
-        // A ':' suffix on a non-suffix handler is dropped ENTIRELY at
-        // runtime: the full name is not in the exact-match handler set and
-        // matches no prefix handler, so it lands in no bucket — no handler
-        // sees it, the element is not even N-applicable through it, and
-        // nothing is logged (round-6 audit, E2).
+        // A ':' suffix on a non-suffix handler is never a binding: the full
+        // name is not in the exact-match handler set and matches no prefix
+        // handler, so since framework L-17 the runtime keeps it as a plain
+        // attribute — no handler sees it, the element is not N-applicable
+        // through it, and nothing is logged (round-6 audit, E2).
         if (handler !== undefined && !handler.isPrefix && binding.suffix !== undefined) {
             diagnostics.push(new vscode.Diagnostic(
                 nameRange(),
-                `'${binding.baseName}' does not take a ':' suffix — the runtime drops '${binding.fullName}' entirely (no handler sees it, nothing is logged). Remove ':${binding.suffix}'.`,
+                `'${binding.baseName}' does not take a ':' suffix — the runtime keeps '${binding.fullName}' as a plain attribute and binds nothing (no handler sees it, nothing is logged). Remove ':${binding.suffix}'.`,
                 vscode.DiagnosticSeverity.Warning
             ));
             return;
@@ -530,17 +583,16 @@ export class nDiagnosticsProvider implements vscode.Disposable {
             return;
         }
 
-        // A prefix handler without its ':name' suffix is silently dead: the
-        // Attributes store admits the bare name as a system attribute, but
-        // every consumer except nb-repeat reads suffixed keys only
-        // (`getAll`/`has` default to isPrefixRequired = true) — nothing is
-        // bound, nothing is logged (round-7 audit, R7-4). The inverse of the
-        // E2 rule above.
+        // A prefix handler without its ':name' suffix binds nothing: every
+        // consumer except nb-repeat reads suffixed keys only. Since framework
+        // L-18 the runtime reports it ('incorrect binding found, <name>
+        // should have meta value …'); before that it was silently dead (round-7
+        // audit, R7-4). The inverse of the E2 rule above.
         if (handler !== undefined && handler.isPrefix && binding.baseName !== 'nb-repeat' && !binding.suffix) {
             const example = PREFIX_SUFFIX_EXAMPLES.get(binding.baseName) ?? 'name';
             diagnostics.push(new vscode.Diagnostic(
                 nameRange(),
-                `'${binding.fullName}' is missing its ':name' suffix — every '${binding.baseName}' consumer reads only '${binding.baseName}:<name>' keys, so this binding is silently dead (nothing is bound, nothing is logged). Write '${binding.baseName}:${example}="…"'.`,
+                `'${binding.fullName}' is missing its ':name' suffix — every '${binding.baseName}' consumer reads only '${binding.baseName}:<name>' keys, so nothing is bound and the runtime logs 'incorrect binding found, ${binding.baseName} should have meta value'. Write '${binding.baseName}:${example}="…"'.`,
                 vscode.DiagnosticSeverity.Warning
             ));
             return;
@@ -641,6 +693,17 @@ export class nDiagnosticsProvider implements vscode.Disposable {
             }
         }
 
+        // nb-in:__proto__ / nb-in-ref:__proto__ are rejected at construction
+        // by ContextedBase (framework L-22) and never delivered.
+        if ((binding.baseName === 'nb-in' || binding.baseName === 'nb-in-ref') && binding.suffix &&
+            kebabToCamelCase(binding.suffix) === '__proto__') {
+            diagnostics.push(new vscode.Diagnostic(
+                nameRange(),
+                `The runtime rejects '${binding.fullName}' with a console error — an input cannot replace the context's prototype.`,
+                vscode.DiagnosticSeverity.Warning
+            ));
+        }
+
         // nb-default must have an EMPTY value — with any value the runtime
         // silently ignores the attribute entirely (Default requires '').
         if (binding.baseName === 'nb-default' && binding.value.trim().length > 0) {
@@ -673,25 +736,42 @@ export class nDiagnosticsProvider implements vscode.Disposable {
         if (binding.baseName === 'nb-event' && binding.suffix) {
             // Uppercase letters never reach the runtime: the browser
             // lowercases the attribute name, so the subscription is to the
-            // lowercased event — a CustomEvent dispatched with the camelCase
-            // name will never match.
+            // lowercased event. Since framework L-26, EventDispatcher.dispatch
+            // and @Eventer lowercase the name they dispatch, so those match;
+            // only an Event created elsewhere keeps its camelCase name.
             if (/[A-Z]/.test(binding.suffix)) {
                 diagnostics.push(new vscode.Diagnostic(
                     nameRange(),
-                    `Attribute names are lowercased by the browser — this subscribes to '${binding.suffix.toLowerCase()}', not '${binding.suffix}'. A CustomEvent dispatched as '${binding.suffix}' will never match; use a lowercase (or kebab-case) event name on both sides.`,
-                    vscode.DiagnosticSeverity.Warning
+                    `Attribute names are lowercased by the browser — this subscribes to '${binding.suffix.toLowerCase()}', not '${binding.suffix}'. EventDispatcher.dispatch() and @Eventer lowercase their names too, so they still match, but an Event created elsewhere (new CustomEvent('${binding.suffix}'), or one passed pre-built to dispatch(event)) will not. Prefer a lowercase or kebab-case name.`,
+                    vscode.DiagnosticSeverity.Information
                 ));
             }
 
-            // Debounce segment must be a plain number — anything else is
-            // silently ignored by the runtime (the handler subscribes
-            // WITHOUT debounce; the error is logged only in debug mode).
-            if (binding.extraSuffix !== undefined && !/^\d+$/.test(binding.extraSuffix)) {
-                diagnostics.push(new vscode.Diagnostic(
-                    nameRange(),
-                    `'${binding.extraSuffix}' is not a valid debounce value — the runtime subscribes WITHOUT debounce and reports nothing outside debug mode. Use a plain number of milliseconds (e.g. 'nb-event:${binding.suffix}:300').`,
-                    vscode.DiagnosticSeverity.Warning
-                ));
+            // Debounce segment: the runtime takes the LAST ':' segment as the
+            // debounce only when parseInt reads a number from it; otherwise the
+            // whole remainder is the event name, silently (namespaced names
+            // like 'plugin:ready' are legal, so only a known DOM event or an
+            // empty tail is flagged as a broken debounce).
+            const eventKey = runtimeEventKey(binding);
+            if (eventKey.tail !== undefined) {
+                if (eventKey.debounce !== undefined) {
+                    if (!/^\d+$/.test(eventKey.tail)) {
+                        diagnostics.push(new vscode.Diagnostic(
+                            nameRange(),
+                            `'${eventKey.tail}' is read as a ${eventKey.debounce} ms debounce (the runtime parses it with parseInt). Write a plain number of milliseconds (e.g. 'nb-event:${eventKey.eventName}:300').`,
+                            vscode.DiagnosticSeverity.Warning
+                        ));
+                    }
+                } else {
+                    const head = eventKey.eventName.substring(0, eventKey.eventName.lastIndexOf(':'));
+                    if (eventKey.tail === '' || KNOWN_DOM_EVENT_NAMES.has(head)) {
+                        diagnostics.push(new vscode.Diagnostic(
+                            nameRange(),
+                            `'${eventKey.tail}' is not a valid debounce value — the runtime keeps the whole name and subscribes to an event literally named '${eventKey.eventName}', which never fires, and logs nothing. Use a plain number of milliseconds (e.g. 'nb-event:${head}:300').`,
+                            vscode.DiagnosticSeverity.Warning
+                        ));
+                    }
+                }
             }
         }
 
@@ -721,14 +801,18 @@ export class nDiagnosticsProvider implements vscode.Disposable {
 
     /**
      * Per-element trap checks (round-6 audit, E9):
-     * - Two nb-event attributes resolving to the same event name: the Events
-     *   handler keys its expression map by event name, so only ONE handler
-     *   survives (exact-duplicate attribute names are deduped by the browser
-     *   — first wins; different spellings like ':click' + ':click:300'
-     *   collide in the map — last wins). Either way the others silently
+     * - Two nb-event attributes resolving to the same event name (computed
+     *   like the runtime, see runtimeEventKey): the Events handler keys its
+     *   expression map by event name, so only ONE handler survives — exact-
+     *   duplicate attribute names are deduped by the browser, and different
+     *   spellings like ':click' + ':click:300' keep the FIRST and log
+     *   'multiple handlers for one event (…) are not supported'. The others
      *   never fire.
-     * - nb-in:x + nb-in-ref:x for the same (camelCased) input name: the
-     *   by-reference delivery silently wins (round-2 framework audit, R2-10).
+     * - nb-in:x + nb-in-ref:x for the same (camelCased) input name: nb-in and
+     *   nb-in-ref share one key space and nb-in is read first, so the nb-in
+     *   binding is kept and the nb-in-ref one is skipped with
+     *   'multiple handlers for one in (x) are not supported' — whatever the
+     *   attribute order (framework R3-5).
      * - nb-in / nb-in-ref on an element hosting no nb-container and no
      *   registered component tag: the inputs are never consumed. Restricted
      *   to dash-less tags so unanalyzed custom elements are never
@@ -744,12 +828,12 @@ export class nDiagnosticsProvider implements vscode.Disposable {
         );
 
         for (const el of parsed.elements) {
-            // Duplicate nb-event subscriptions (runtime event name =
-            // lowercased suffix; the debounce segment is not part of the key).
+            // Duplicate nb-event subscriptions, keyed by the runtime event name
+            // (a numeric debounce segment is not part of it).
             const eventGroups = new Map<string, TemplateAttribute[]>();
             for (const attr of el.nbAttributes) {
                 if (attr.baseName === 'nb-event' && attr.suffix) {
-                    const eventName = attr.suffix.toLowerCase();
+                    const eventName = runtimeEventKey(attr).eventName;
                     const group = eventGroups.get(eventName);
                     if (group) {
                         group.push(attr);
@@ -763,26 +847,28 @@ export class nDiagnosticsProvider implements vscode.Disposable {
                 for (const attr of group) {
                     diagnostics.push(new vscode.Diagnostic(
                         nameRange(attr),
-                        `Multiple 'nb-event' attributes on this element subscribe to '${eventName}' — the runtime keeps only ONE handler (its expression map is keyed by event name); the others silently never fire. Merge them into one expression.`,
+                        `Multiple 'nb-event' attributes on this element subscribe to '${eventName}' — the runtime keeps only the FIRST handler and logs 'multiple handlers for one event (${eventName}) are not supported'; the others never fire. Merge them into one expression.`,
                         vscode.DiagnosticSeverity.Warning
                     ));
                 }
             }
 
-            // nb-in vs nb-in-ref delivering to the same input.
-            const byRefNames = new Set<string>();
+            // nb-in vs nb-in-ref delivering to the same input: the runtime
+            // reads nb-in first, so it keeps nb-in and skips nb-in-ref.
+            const byValueNames = new Set<string>();
             for (const attr of el.nbAttributes) {
-                if (attr.baseName === 'nb-in-ref' && attr.suffix) {
-                    byRefNames.add(kebabToCamelCase(attr.suffix));
+                if (attr.baseName === 'nb-in' && attr.suffix) {
+                    byValueNames.add(kebabToCamelCase(attr.suffix));
                 }
             }
-            if (byRefNames.size > 0) {
+            if (byValueNames.size > 0) {
                 for (const attr of el.nbAttributes) {
-                    if (attr.baseName === 'nb-in' && attr.suffix &&
-                        byRefNames.has(kebabToCamelCase(attr.suffix))) {
+                    if (attr.baseName === 'nb-in-ref' && attr.suffix &&
+                        byValueNames.has(kebabToCamelCase(attr.suffix))) {
+                        const inputName = kebabToCamelCase(attr.suffix);
                         diagnostics.push(new vscode.Diagnostic(
                             nameRange(attr),
-                            `Input '${kebabToCamelCase(attr.suffix)}' is also bound with 'nb-in-ref' on this element — the by-reference binding silently wins and this 'nb-in' value is never delivered. Remove one of the two.`,
+                            `Input '${inputName}' is also bound with 'nb-in' on this element — the runtime keeps the 'nb-in' binding and skips this 'nb-in-ref' one, logging 'multiple handlers for one in (${inputName}) are not supported'. Remove one of the two.`,
                             vscode.DiagnosticSeverity.Warning
                         ));
                     }
@@ -816,11 +902,11 @@ export class nDiagnosticsProvider implements vscode.Disposable {
         // elements to the nearest N-APPLICABLE ancestor. Applicability
         // (`NElement.isNApplicable`) comes from a KNOWN_HANDLERS_SET /
         // KNOWN_PREFIX_HANDLERS attribute or a registered component tag —
-        // the projection trio, nb-component, and unmatched unknown names do
-        // NOT grant it, so such wrappers are transparent at runtime and must
+        // the projection trio, nb-component, nb-in / nb-in-ref and unmatched
+        // unknown names do NOT grant it, so such wrappers are transparent at runtime and must
         // be transparent here too (round-7 audit, R7-1). A switch above the
         // nearest applicable ancestor does not control this case — the Case
-        // handler logs "must have direct nb-switch parent" and stays inert.
+        // handler logs "must have direct nb-switch nuBond parent" and stays inert.
         // Unregistered dashed tags are treated as transparent (matching the
         // runtime's components-registry lookup; conservative for tags the
         // analyzer hasn't seen).

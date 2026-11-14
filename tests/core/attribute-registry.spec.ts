@@ -357,6 +357,14 @@ describe('attribute-registry', () => {
             }
         });
 
+        it('@ constant documents which words keep their type, incl. null / undefined (framework L-47)', () => {
+            const constant = getHandlerInfo('nb-if')!.prefixes.find(p => p.char === '@')!;
+            for (const word of ['`true`', '`false`', '`null`', '`undefined`']) {
+                expect(constant.description).toContain(word);
+            }
+            expect(getHandlerInfo('nb-if')!.examples.join('\n')).toContain('`@null` / `@undefined`');
+        });
+
         it('nb-prop blocklist documentation includes outerHTML (framework fix #3, 2026-07-13)', () => {
             expect(getHandlerInfo('nb-prop')!.notes ?? '').toContain('outerHTML');
         });
@@ -394,9 +402,37 @@ describe('attribute-registry', () => {
             expect(info.notes ?? '').toMatch(/priority/i);
         });
 
-        it('nb-switch and nb-case document stringified matching', () => {
-            expect(getHandlerInfo('nb-switch')!.notes ?? '').toMatch(/STRINGIFIED/i);
-            expect(getHandlerInfo('nb-case')!.expressionType).toMatch(/stringified/i);
+        it('nb-switch and nb-case document type-strict primitive matching (objects by stringified text)', () => {
+            const notes = getHandlerInfo('nb-switch')!.notes ?? '';
+            expect(notes).toMatch(/TYPE-STRICT/);
+            expect(notes).toMatch(/does not match/);
+            expect(notes).not.toMatch(/all stringify to the empty string/);
+            expect(getHandlerInfo('nb-switch')!.expressionType).toMatch(/===/);
+            expect(getHandlerInfo('nb-case')!.expressionType).toMatch(/===/);
+            expect(getHandlerInfo('nb-case')!.description).not.toMatch(/STRINGIFIED/);
+        });
+
+        it('nb-class and nb-style document that a ";" inside a quoted literal needs no escape', () => {
+            for (const name of ['nb-class', 'nb-style']) {
+                const notes = getHandlerInfo(name)!.notes ?? '';
+                expect(notes).toMatch(/quoted string literal/);
+                expect(notes).toContain('\\;');
+            }
+        });
+
+        it('nb-container, nb-template and nb-projection document fallback / authoring-context binding', () => {
+            expect(getHandlerInfo('nb-container')!.notes ?? '').toMatch(/fallback content \(its children without `nb-projection`\), bound by the outer context/);
+            expect(getHandlerInfo('nb-template')!.notes ?? '').toMatch(/cannot be loaded.*fallback.*marked ready/);
+            const projection = getHandlerInfo('nb-projection')!.notes ?? '';
+            expect(projection).toMatch(/DIRECT children/);
+            expect(projection).toMatch(/AUTHORING \(outer\) context/);
+        });
+
+        it('nb-in documents that in-place mutations are delivered, nb-in-ref that they are not', () => {
+            const inNotes = getHandlerInfo('nb-in')!.notes ?? '';
+            expect(inNotes).not.toMatch(/never delivered/);
+            expect(inNotes).toMatch(/in-place mutation of the same object are both delivered/);
+            expect(getHandlerInfo('nb-in-ref')!.notes ?? '').toMatch(/in-place mutation is NOT re-delivered/);
         });
 
         it('nb-repeat documents the lowercase prefix requirement', () => {

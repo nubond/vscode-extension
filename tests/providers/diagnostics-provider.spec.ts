@@ -1272,16 +1272,32 @@ describe('nDiagnosticsProvider — round 4 fixes', () => {
             expect(diags.filter(d => d.message.includes('not valid JavaScript identifiers'))).toHaveLength(0);
         });
 
-        it('warns on a camelCase nb-event suffix (subscription can never match the camelCase dispatch)', () => {
+        it('informs on a camelCase nb-event suffix: framework dispatch is lowercased (L-26), foreign events are not', () => {
             const diags = diagsFor('<div nb-event:myEvent="this.v = \'1\'"></div>');
             const diag = diags.find(d => d.message.includes("subscribes to 'myevent'"));
             expect(diag).toBeDefined();
-            expect(diag.severity).toBe(vscode.DiagnosticSeverity.Warning);
+            expect(diag.message).toContain('EventDispatcher.dispatch() and @Eventer lowercase their names too');
+            expect(diag.message).not.toContain('will never match;');
+            expect(diag.severity).toBe(vscode.DiagnosticSeverity.Information);
         });
 
-        it('warns on a non-numeric debounce segment', () => {
+        it('warns on a non-numeric debounce segment: the runtime subscribes to the literal name', () => {
             const diags = diagsFor('<div nb-event:click:abc="this.v = \'1\'"></div>');
             const diag = diags.find(d => d.message.includes('not a valid debounce value'));
+            expect(diag).toBeDefined();
+            expect(diag.message).toContain("event literally named 'click:abc'");
+            expect(diag.message).not.toContain('WITHOUT debounce');
+        });
+
+        it('does not flag a namespaced custom event name (nb-event:plugin:ready)', () => {
+            const diags = diagsFor('<div nb-event:plugin:ready="this.v = \'1\'" nb-event:plugin:done:250="this.w = \'1\'"></div>');
+            expect(diags.filter(d => d.message.includes('debounce'))).toHaveLength(0);
+            expect(diags.filter(d => d.message.includes('subscribe to'))).toHaveLength(0);
+        });
+
+        it('warns on a debounce that parseInt only partly reads (nb-event:click:300ms)', () => {
+            const diags = diagsFor('<div nb-event:click:300ms="this.v = \'1\'"></div>');
+            const diag = diags.find(d => d.message.includes("is read as a 300 ms debounce"));
             expect(diag).toBeDefined();
         });
 
@@ -1485,9 +1501,11 @@ describe('nDiagnosticsProvider — round-6 shape and trap checks', () => {
     }
 
     describe('E2: dead suffix on non-suffix handlers', () => {
-        it('flags nb-value:foo — the runtime drops the attribute entirely', () => {
+        it('flags nb-value:foo — the runtime keeps it as a plain attribute and binds nothing (L-17)', () => {
             const diags = diagsFor('<div nb-value:foo="this.v"></div>');
-            expect(diags.some(d => d.message.includes("does not take a ':' suffix"))).toBe(true);
+            const diag = diags.find(d => d.message.includes("does not take a ':' suffix"));
+            expect(diag).toBeDefined();
+            expect(diag.message).toContain("keeps 'nb-value:foo' as a plain attribute and binds nothing");
         });
 
         it('flags every non-suffix handler carrying a suffix', () => {
@@ -1607,6 +1625,19 @@ describe('nDiagnosticsProvider — round-6 shape and trap checks', () => {
             expect(diagsFor('<div nb-attr:disabled="this.d" nb-attr:aria-label="this.l"></div>')).toHaveLength(0);
         });
 
+        const reserved = (target: string) => diagsFor(`<div nb-attr:${target}="this.v"></div>`)
+            .some(d => d.message.includes('framework-reserved'));
+
+        it.each(['nb-var:x', 'nb-event:click', 'nb-repeat', 'nb-repeat:row', 'nb-in:x', 'nb-in-ref:y', 'nb-component', 'nb-projection', 'data-nb-in--x', 'nb-var', 'nb-event', 'nb-in', 'nb-in-ref', 'nb-attr'])(
+            'mirrors the runtime: nb-attr:%s is reserved (framework L-16)', (target) => {
+                expect(reserved(target)).toBe(true);
+            });
+
+        it.each(['nb-variant', 'nb-eventx', 'nb-repeated', 'nb-index', 'nb-custom'])(
+            'mirrors the runtime: nb-attr:%s is NOT reserved (framework L-16)', (target) => {
+                expect(reserved(target)).toBe(false);
+            });
+
         it('flags every blocked nb-prop target including outerHTML', () => {
             for (const suffix of ['class-name', 'class-list', 'style', 'text-content',
                                   'inner-text', 'inner-h-t-m-l', 'outer-h-t-m-l', 'innerhtml']) {
@@ -1618,12 +1649,42 @@ describe('nDiagnosticsProvider — round-6 shape and trap checks', () => {
         it('does not flag ordinary nb-prop targets', () => {
             expect(diagsFor('<div nb-prop:value="this.v" nb-prop:selected-index="this.i"></div>')).toHaveLength(0);
         });
+
+        it('flags nb-prop:__proto__ (framework L-22)', () => {
+            const diags = diagsFor('<div nb-prop:__proto__="this.v"></div>');
+            expect(diags.some(d => d.message.includes('runtime rejects') && d.message.includes('__proto__'))).toBe(true);
+        });
+
+        it.each(['nb-in', 'nb-in-ref'])('flags %s:__proto__ (framework L-22)', (handler) => {
+            const diags = diagsFor(`<div nb-container="@C" ${handler}:__proto__="this.v"></div>`);
+            expect(diags.some(d => d.message.includes('runtime rejects') &&
+                                   d.message.includes(`${handler}:__proto__`))).toBe(true);
+        });
+
+        it('does not flag ordinary nb-in names', () => {
+            const diags = diagsFor('<div nb-container="@C" nb-in:proto="this.v" nb-in-ref:user-data="this.u"></div>');
+            expect(diags.some(d => d.message.includes('runtime rejects'))).toBe(false);
+        });
     });
 
     describe('E9: element-level traps', () => {
         it('flags duplicate nb-event subscriptions (debounce variant collides too)', () => {
             const diags = diagsFor('<button nb-event:click="this.a()" nb-event:click:300="this.b()"></button>');
-            expect(diags.filter(d => d.message.includes("subscribe to 'click'"))).toHaveLength(2);
+            const dups = diags.filter(d => d.message.includes("subscribe to 'click'"));
+            expect(dups).toHaveLength(2);
+            expect(dups[0].message).toContain('keeps only the FIRST handler');
+            expect(dups[0].message).toContain('multiple handlers for one event (click) are not supported');
+        });
+
+        it('keys duplicates by the runtime event name (namespaced names and a non-numeric tail are distinct)', () => {
+            const diags = diagsFor('<button nb-event:plugin:ready="this.a()" nb-event:plugin:done="this.b()" ' +
+                                   'nb-event:click="this.c()" nb-event:click:abc="this.d()"></button>');
+            expect(diags.filter(d => d.message.includes('subscribe to'))).toHaveLength(0);
+        });
+
+        it('flags a namespaced name with and without a debounce as duplicates', () => {
+            const diags = diagsFor('<button nb-event:plugin:ready="this.a()" nb-event:plugin:ready:250="this.b()"></button>');
+            expect(diags.filter(d => d.message.includes("subscribe to 'plugin:ready'"))).toHaveLength(2);
         });
 
         it('does not flag different events on one element', () => {
@@ -1631,16 +1692,24 @@ describe('nDiagnosticsProvider — round-6 shape and trap checks', () => {
             expect(diags.filter(d => d.message.includes('subscribe to'))).toHaveLength(0);
         });
 
-        it('flags nb-in + nb-in-ref for the same (camelCased) input — nb-in silently loses', () => {
-            const diags = diagsFor('<div nb-container="@C" nb-in:user-data="this.a" nb-in-ref:user-data="this.b"></div>');
-            const collisions = diags.filter(d => d.message.includes("also bound with 'nb-in-ref'"));
+        it.each([
+            ['nb-in first', '<div nb-container="@C" nb-in:user-data="this.a" nb-in-ref:user-data="this.b"></div>'],
+            ['nb-in-ref first', '<div nb-container="@C" nb-in-ref:user-data="this.b" nb-in:user-data="this.a"></div>'],
+        ])('flags the nb-in-ref of an nb-in + nb-in-ref pair — the runtime keeps nb-in (%s)', (_label, html) => {
+            const diags = diagsFor(html);
+            const collisions = diags.filter(d => d.message.includes("also bound with 'nb-in'"));
             expect(collisions).toHaveLength(1);
             expect(collisions[0].message).toContain("'userData'");
+            expect(collisions[0].message).toContain("keeps the 'nb-in' binding and skips this 'nb-in-ref' one");
+            expect(collisions[0].message).toContain('multiple handlers for one in (userData) are not supported');
+            // anchored on the nb-in-ref attribute (the one the runtime skips)
+            const expectedStart = createMockDocument(html).positionAt(html.indexOf('nb-in-ref:user-data'));
+            expect(collisions[0].range.start.character).toBe(expectedStart.character);
         });
 
         it('does not flag distinct input names', () => {
             const diags = diagsFor('<div nb-container="@C" nb-in:a="this.a" nb-in-ref:b="this.b"></div>');
-            expect(diags.filter(d => d.message.includes("also bound with 'nb-in-ref'"))).toHaveLength(0);
+            expect(diags.filter(d => d.message.includes("also bound with 'nb-in'"))).toHaveLength(0);
         });
 
         it('flags inputs on a plain element with no container and no component', () => {
@@ -1747,13 +1816,42 @@ describe('nDiagnosticsProvider — round-7 fixes', () => {
             expect(directChildDiags(diags)).toHaveLength(0);
         });
 
-        it('an unknown attribute that startsWith a prefix handler still grants applicability (runtime quirk)', () => {
-            // 'nb-index'.indexOf('nb-in') === 0 — the runtime's plain
-            // startsWith check makes this wrapper applicable, so the case IS
-            // inert. (The wrapper also gets its own unknown-attribute warning.)
+        it.each(['nb-eventx', 'nb-variant', 'nb-repeated'])(
+            'a look-alike %s no longer grants applicability — prefixes match with their separator (framework L-16)', (attr) => {
+                const diags = diagsFor(
+                    `<div nb-switch="this.v"><div ${attr}="x"><span nb-case="@1">a</span></div></div>`);
+                expect(directChildDiags(diags)).toHaveLength(0);
+            });
+
+        it.each(['nb-var:x', 'nb-repeat', 'nb-repeat:row', 'data-nb-var--x'])(
+            'a real prefix handler (%s) still grants applicability', (attr) => {
+                const w3c = attr.startsWith('data-');
+                const sw = w3c ? 'data-nb-switch' : 'nb-switch';
+                const cs = w3c ? 'data-nb-case' : 'nb-case';
+                const diags = diagsFor(
+                    `<div ${sw}="this.v"><div ${attr}="this.x"><span ${cs}="@1">a</span></div></div>`);
+                expect(directChildDiags(diags)).toHaveLength(1);
+            });
+
+        it('nb-index no longer grants applicability — nb-in is not a KNOWN_PREFIX_HANDLERS entry (framework L-21)', () => {
             const diags = diagsFor(
                 '<div nb-switch="this.v"><div nb-index="x"><span nb-case="@1">a</span></div></div>');
-            expect(directChildDiags(diags)).toHaveLength(1);
+            expect(directChildDiags(diags)).toHaveLength(0);
+        });
+
+        it.each(['nb-in:label', 'nb-in-ref:label', 'data-nb-in--label'])(
+            'a wrapper carrying only %s is transparent (framework L-21)', (attr) => {
+                const w3c = attr.startsWith('data-');
+                const sw = w3c ? 'data-nb-switch' : 'nb-switch';
+                const cs = w3c ? 'data-nb-case' : 'nb-case';
+                const diags = diagsFor(
+                    `<div ${sw}="this.v"><div ${attr}="this.x"><span ${cs}="@1">a</span></div></div>`);
+                expect(directChildDiags(diags)).toHaveLength(0);
+            });
+
+        it('nb-attr:nb-in:* is still a reserved target (system attribute)', () => {
+            const diags = diagsFor('<div nb-attr:nb-in:label="this.x"></div>');
+            expect(diags.some((d: any) => d.message.includes('nb-in:label'))).toBe(true);
         });
 
         it('an unknown attribute with no prefix-handler match does NOT grant applicability', () => {
@@ -1763,8 +1861,8 @@ describe('nDiagnosticsProvider — round-7 fixes', () => {
         });
 
         it('a dead suffixed spelling (nb-value:foo) does not grant applicability', () => {
-            // The runtime drops 'nb-value:foo' entirely (E2) — it is not in
-            // KNOWN_HANDLERS_SET and matches no prefix handler, so the
+            // 'nb-value:foo' is not in KNOWN_HANDLERS_SET and matches no prefix
+            // handler (E2), so the runtime keeps it as a plain attribute: the
             // wrapper stays transparent and the case works.
             const diags = diagsFor(
                 '<div nb-switch="this.v"><div nb-value:foo="x"><span nb-case="@1">a</span></div></div>');
@@ -1784,7 +1882,7 @@ describe('nDiagnosticsProvider — round-7 fixes', () => {
         });
     });
 
-    describe('R7-4: prefix handlers without a suffix are silently dead', () => {
+    describe('R7-4: prefix handlers without a suffix bind nothing (the runtime reports it since L-18)', () => {
         const missingSuffix = (diags: any[]) =>
             diags.filter((d: any) => d.message.includes('missing its'));
 
@@ -1799,6 +1897,9 @@ describe('nDiagnosticsProvider — round-7 fixes', () => {
             const diags = diagsFor(
                 '<div nb-in="this.a" nb-in-ref="this.b" nb-prop="this.c" nb-attr="this.d" nb-var="this.e"></div>');
             expect(missingSuffix(diags)).toHaveLength(5);
+            // since framework L-18 the runtime reports it
+            expect(missingSuffix(diags)[0].message).toContain("the runtime logs 'incorrect binding found, nb-in should have meta value'");
+            expect(missingSuffix(diags)[0].message).not.toContain('nothing is logged');
         });
 
         it('flags bare nb-aspect with and without a value (no aspect is named)', () => {

@@ -51,7 +51,7 @@ const SINGLE_BIND_PREFIX: PrefixInfo = {
 const CONSTANT_PREFIX: PrefixInfo = {
     char: '@',
     name: 'Constant',
-    description: 'Treated as a literal constant value (no evaluation).'
+    description: 'Treated as a literal constant value (no evaluation). Numbers and the exact words `true`, `false`, `null` and `undefined` keep their type; anything else is a string.'
 };
 
 const ROUTE_PREFIX: PrefixInfo = {
@@ -131,7 +131,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-class="{active: this.isActive; hidden: this.isHidden}"',
             'nb-class="@my-static-class"'
         ],
-        notes: 'Trailing or empty entries inside `[ ]` / `{ }` are filtered out; escape a literal `;` inside an entry as `\\;`.'
+        notes: 'Trailing or empty entries inside `[ ]` / `{ }` are filtered out. A `;` inside a quoted string literal (`\'…\'`, `"…"` or `` `…` ``) is text, not a separator, and the literal keeps its JavaScript escapes; elsewhere escape a literal `;` as `\\;` (a `;` inside a regex literal still needs `\\;`).'
     },
     {
         attribute: 'nb-style',
@@ -146,7 +146,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-style="opacity: #this.initialOpacity; color: this.textColor"',
             'nb-style="background-color: this.themeBg"'
         ],
-        notes: 'There is NO whole-value expression prefix: the runtime splits `prop: expr` entries FIRST, so a leading `#` becomes part of the first property name (`#opacity` — a silent dead style). Put the `#` single-bind prefix on an entry\'s own expression instead (`opacity: #expr`). Trailing or empty entries are filtered out; escape a literal `;` in a value as `\\;`. Evaluating a property to `null`, `undefined`, or `\'\'` removes it from the inline style. Property names must be KEBAB-CASE (`background-color`) — the runtime passes them to `style.setProperty()` verbatim, so a camelCase name (`backgroundColor`) is a silent no-op. A value ending with `!important` IS honoured: the runtime splits the flag off and passes `important` as the `setProperty` priority (matched case-insensitively). Exceptions: a value that is ONLY the flag is not treated as a priority, and a spaced `! important` is not recognized (it stays in the value and the declaration is dropped by the CSS parser).'
+        notes: 'There is NO whole-value expression prefix: the runtime splits `prop: expr` entries FIRST, so a leading `#` becomes part of the first property name (`#opacity` — a silent dead style). Put the `#` single-bind prefix on an entry\'s own expression instead (`opacity: #expr`). Trailing or empty entries are filtered out. A `;` inside a quoted string literal (e.g. `background: url(\'a;b.png\')`) is text, not a separator; elsewhere escape a literal `;` in a value as `\\;`. Evaluating a property to `null`, `undefined`, or `\'\'` removes it from the inline style. Property names must be KEBAB-CASE (`background-color`) — the runtime passes them to `style.setProperty()` verbatim, so a camelCase name (`backgroundColor`) is a silent no-op. A value ending with `!important` IS honoured: the runtime splits the flag off and passes `important` as the `setProperty` priority (matched case-insensitively). Exceptions: a value that is ONLY the flag is not treated as a priority, and a spaced `! important` is not recognized (it stays in the value and the declaration is dropped by the CSS parser).'
     },
     {
         attribute: 'nb-attr',
@@ -163,7 +163,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-attr:aria-label="this.label"',
             'nb-attr:open="this.isOpen ? \'\' : null"'
         ],
-        notes: 'Cannot bind to `class` (use `nb-class`) or `style` (use `nb-style`); framework-reserved `nb-*` / `data-nb-*` attribute names are rejected. Only `null` / `undefined` REMOVE the attribute — `false` is stringified to the literal `"false"`, which keeps boolean attributes like `disabled` / `checked` / `readonly` ACTIVE. Map booleans yourself: `this.flag ? \'\' : null`.'
+        notes: 'Cannot bind to `class` (use `nb-class`) or `style` (use `nb-style`); framework attribute names are rejected (`nb-value`, `nb-var:x`, a bare `nb-var` or `nb-in`, … and their `data-nb-*` spellings), while look-alikes such as `nb-index` or `nb-variant` are ordinary attributes and bind normally. Only `null` / `undefined` REMOVE the attribute — `false` is stringified to the literal `"false"`, which keeps boolean attributes like `disabled` / `checked` / `readonly` ACTIVE. Map booleans yourself: `this.flag ? \'\' : null`.'
     },
     {
         attribute: 'nb-prop',
@@ -193,7 +193,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-if="this.isVisible"',
             'nb-if="#this.showOnce"',
             'nb-if="this.items.length > 0"',
-            'nb-if="@false"  <!-- constant: `@true` / `@false` are real booleans -->'
+            'nb-if="@false"  <!-- constant: `@true` / `@false` are real booleans, `@null` / `@undefined` real null / undefined -->'
         ]
     },
     {
@@ -218,20 +218,20 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
         attribute: 'nb-switch',
         displayName: 'Switch Statement',
         description: 'Evaluates an expression and shows the matching `nb-case` child element. Works together with `nb-case` and `nb-default`.',
-        expressionType: 'any (matched by STRINGIFIED value)',
+        expressionType: 'any (matched with `===`; objects, arrays, functions and `NaN` by their stringified text)',
         isPrefix: false,
         prefixes: [SINGLE_BIND_PREFIX],
         injectedParams: [],
         examples: [
             'nb-switch="this.status"'
         ],
-        notes: 'Child elements should use `nb-case` or `nb-default`. Matching compares STRINGIFIED values: the number `5` matches the string `\'5\'`, and `undefined`, `null`, and `\'\'` all stringify to the empty string — a "nothing selected" switch value activates an empty-string case instead of `nb-default`.'
+        notes: 'Child elements should use `nb-case` or `nb-default`. Matching is TYPE-STRICT for primitives (`===`): the number `5` does not match the string `\'5\'` (router slot values are strings — use `nb-case="\'5\'"`, not `@5`), and `undefined`, `null` and `\'\'` are three different values. Objects, arrays, functions and `NaN` are compared by their stringified text (`{a:1}` matches `\'{"a":1}\'`, a function matches `\'\'`).'
     },
     {
         attribute: 'nb-case',
         displayName: 'Switch Case',
-        description: 'A case branch inside an `nb-switch`. Visible when the case value matches the parent switch expression (STRINGIFIED comparison — see `nb-switch`).',
-        expressionType: 'any (matched by stringified value against the parent nb-switch)',
+        description: 'A case branch inside an `nb-switch`. Visible when the case value matches the parent switch expression (type-strict for primitives — see `nb-switch`).',
+        expressionType: 'any (matched with `===` against the parent nb-switch; objects, arrays, functions and `NaN` by stringified text)',
         isPrefix: false,
         prefixes: [CONSTANT_PREFIX, SINGLE_BIND_PREFIX],
         injectedParams: [],
@@ -258,10 +258,10 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
     {
         attribute: 'nb-event',
         displayName: 'Event Handler',
-        description: 'Subscribes to a DOM event on the element. The event name is specified after the first colon. An optional second colon suffix specifies debounce in milliseconds.',
+        description: 'Subscribes to a DOM event on the element. The event name is specified after the first colon. An optional last colon segment that is a number specifies debounce in milliseconds; a non-numeric last segment stays part of the event name.',
         expressionType: 'void | Promise<void>',
         isPrefix: true,
-        suffixDescription: 'Event name (e.g., `click`, `input`, `mouseover`). Optional debounce in milliseconds: `nb-event:click:300`.',
+        suffixDescription: 'Event name (e.g., `click`, `input`, `mouseover`). Optional debounce in milliseconds: `nb-event:click:300`. The debounce is read from the LAST segment only when it is a number, so namespaced names work verbatim (`nb-event:plugin:ready`, `nb-event:plugin:ready:250`) — and a mistyped debounce (`nb-event:click:abc`) subscribes to an event literally named `click:abc` that never fires.',
         prefixes: [SINGLE_BIND_PREFIX, CONSTANT_PREFIX],
         injectedParams: EVENT_INJECTED_PARAMS,
         examples: [
@@ -271,7 +271,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-event:click="this.router.go(\'home\'), event.preventDefault()"',
             'nb-event:click="#this.handleOnce()"  <!-- one-time, auto-unsubscribes -->'
         ],
-        notes: 'With `#` prefix, the event auto-unsubscribes after the first trigger — but note: if the handler returns a Promise that REJECTS, the auto-unsubscribe is skipped and the handler can fire again. Call `unSubscribe()` for manual control. If the handler returns a `Promise`, a change-detection cycle is automatically scheduled when it settles, otherwise change-detection cycle is automatically scheduled after expression execution. Two `nb-event` attributes resolving to the same event name overwrite each other — only one handler ends up subscribed.'
+        notes: 'With `#` prefix, the event auto-unsubscribes after the first trigger — but note: if the handler returns a Promise that REJECTS, the auto-unsubscribe is skipped and the handler can fire again. Call `unSubscribe()` for manual control. If the handler returns a `Promise`, a change-detection cycle is automatically scheduled when it settles, otherwise change-detection cycle is automatically scheduled after expression execution. Two `nb-event` attributes resolving to the same event name (e.g. `nb-event:click` + `nb-event:click:300`) keep the FIRST handler; the other is skipped with a console error (`multiple handlers for one event (click) are not supported`).'
     },
     {
         attribute: 'nb-var',
@@ -332,7 +332,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-container="this.currentContainerName"  <!-- dynamic -->',
             '<div nb-container="@UserCard" nb-in:user="this.activeUser"></div>'
         ],
-        notes: 'Route-bound containers (`%slot`) update automatically when `Router.state[slot]` changes. An empty or unknown name disposes the current container and restores the element\'s original (fallback/projection) content — it does not hide the element.'
+        notes: 'Route-bound containers (`%slot`) update automatically when `Router.state[slot]` changes. An empty or unknown name, or a template that fails to load, disposes the current container and shows the host\'s fallback content (its children without `nb-projection`), bound by the outer context — it does not hide the element.'
     },
     {
         attribute: 'nb-component',
@@ -361,7 +361,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-template="@warning-icon"',
             'nb-template="@left-right-tile"'
         ],
-        notes: 'The value must start with `@`. Templates are loaded asynchronously when not yet ready; the element is repopulated once the template resolves.'
+        notes: 'The value must start with `@`. Templates are loaded asynchronously when not yet ready; the element is repopulated once the template resolves. If the template cannot be loaded, the element shows its fallback content (children without `nb-projection`), bound, and is marked ready. Content projected into a global template binds in the context that uses it.'
     },
     {
         attribute: 'nb-aspect',
@@ -394,7 +394,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-in:title="this.pageTitle"',
             'nb-in:user="this.activeUser"'
         ],
-        notes: 'The child receives a deep clone (`structuredClone`), not the parent\'s object reference — mutations are isolated on both sides. Two delivery caveats: an input only updates when the bound expression produces a NEW, deep-unequal value — mutating the SAME object in place is never delivered to the child; and a value `structuredClone` cannot copy (functions, DOM nodes, class instances with non-cloneable state) fails delivery permanently — use `nb-in-ref` for such objects.'
+        notes: 'The child receives a deep clone (`structuredClone`), not the parent\'s object reference — mutations are isolated on both sides. Delivery is deep-compared against a clone of the last delivered value, so a replaced object AND an in-place mutation of the same object are both delivered, while a new object with identical contents is not. A value `structuredClone` cannot copy (functions, DOM nodes, class instances with non-cloneable state) fails delivery permanently — use `nb-in-ref` for such objects.'
     },
     {
         attribute: 'nb-in-ref',
@@ -409,7 +409,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-in-ref:items="this.sharedList"',
             'nb-in-ref:host-element="this.rootEl"'
         ],
-        notes: 'The child sees the same object reference as the parent — mutations are observable on both sides.'
+        notes: 'The child sees the same object reference as the parent — mutations are observable on both sides. An in-place mutation is NOT re-delivered (the compare baseline is the shared live object), so the child\'s data is current but its DOM stays stale until a new reference is assigned.'
     },
     {
         attribute: 'nb-projection',
@@ -424,7 +424,7 @@ const HANDLER_REGISTRY: HandlerInfo[] = [
             'nb-projection="@header"',
             'nb-projection="@content:left"  <!-- named slot with qualifier -->'
         ],
-        notes: 'Only one default (empty-value) projection per parent is allowed. Slot names are taken literally — `@header` here matches `@header` on the target, not the bare string `header`.'
+        notes: 'Only one default (empty-value) projection per parent is allowed. Slot names are taken literally — `@header` here matches `@header` on the target, not the bare string `header`. Only DIRECT children of the host are projections (one inside a wrapper makes the wrapper fallback content). Projected content is bound by the AUTHORING (outer) context — `this` is the parent, not the receiving container/component.'
     },
     {
         attribute: 'nb-project-to',

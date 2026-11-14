@@ -60,6 +60,13 @@
           }
         },
         {
+          "comment": "@null / @undefined literal: @null, @undefined",
+          "match": "@(null|undefined)\\b",
+          "captures": {
+            "0": { "name": "constant.language.ts" }
+          }
+        },
+        {
           "comment": "@string literal: @anything_else",
           "match": "@([^\"]+)",
           "captures": {

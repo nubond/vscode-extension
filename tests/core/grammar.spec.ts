@@ -305,6 +305,36 @@ describe('Grammar: html.json', () => {
         });
     });
 
+    // Framework L-47: `@null` / `@undefined` are real null / undefined (were the strings "null" / "undefined")
+    describe('@null / @undefined literal', () => {
+        const rule = findRule('@null / @undefined literal');
+
+        it.each(['@null', '@undefined'])('should match %s', (text) => {
+            const m = execRule(rule, text);
+            expect(m).not.toBeNull();
+            expect(m![0]).toBe(text);
+        });
+
+        it('should not match @nullable or @undefinedValue (word boundary)', () => {
+            expect(execRule(rule, '@nullable')).toBeNull();
+            expect(execRule(rule, '@undefinedValue')).toBeNull();
+        });
+
+        it('should not match other casings (the framework is case-sensitive)', () => {
+            expect(execRule(rule, '@NULL')).toBeNull();
+            expect(execRule(rule, '@Undefined')).toBeNull();
+        });
+
+        it('should have the constant.language.ts scope (same as bare null / undefined)', () => {
+            expect(rule.captures!['0'].name).toBe('constant.language.ts');
+        });
+
+        it('should come before the @string catch-all so it wins', () => {
+            const rules = getExpressionRules();
+            expect(rules.indexOf(rule)).toBeLessThan(rules.indexOf(findRule('@string literal')));
+        });
+    });
+
     describe('@string literal', () => {
         const rule = findRule('@string literal');
 
