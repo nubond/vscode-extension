@@ -258,7 +258,7 @@ describe('attribute-registry', () => {
         it('nb-var documents reserved-name conflicts', () => {
             const info = getHandlerInfo('nb-var')!;
             expect(info.notes ?? '').toMatch(/reserved|transformer/i);
-            // Reserved names from Constants.RESERVED_CONTEXT_NAMES.
+            // Reserved names from Constants.EXPRESSIONS.RESERVED_CONTEXT_NAMES.
             for (const reserved of ['item', 'index', 'count', 'event', 'data', 'router', 'unSubscribe', 'nativeElement', 'element']) {
                 expect(info.notes ?? '').toContain(reserved);
             }

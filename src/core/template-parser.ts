@@ -613,7 +613,7 @@ export function getAllRepeatScopes(parsed: ParsedTemplate, offset: number, exclu
 
 /**
  * Reserved context names (mirror of the framework's
- * `Constants.RESERVED_CONTEXT_NAMES`, lowercased). The Variables handler
+ * `Constants.EXPRESSIONS.RESERVED_CONTEXT_NAMES`, lowercased). The Variables handler
  * refuses to CREATE an nb-var with one of these names — such a var never
  * exists at runtime, so scope helpers must not report it as a live local.
  */
